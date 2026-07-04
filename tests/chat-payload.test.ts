@@ -264,3 +264,108 @@ describe('applyStoredFields / storedFieldsEqual (shared DB-row mapping)', () => 
     expect(storedFieldsEqual({ ...applied, parts_raw: '[{}]' }, row)).toBe(false);
   });
 });
+
+describe('pickMessageParts (from-DB ordering fix)', () => {
+  it('prefers parsed parts_raw over the SDK-built msg.parts so interleaved tool-invocations are not pushed to the bottom', async () => {
+    const { pickMessageParts } = await import('../components/chat/helpers');
+    // The agent loop records parts in the exact order they happened. For
+    // a typical ReAct turn that's: step-start → reasoning → tool-invocation
+    // → text → (next step) → reasoning → tool-invocation → text.
+    const interleavedFromDB = [
+      { type: 'step-start' },
+      { type: 'reasoning', reasoning: 'I should look at the file first.' },
+      {
+        type: 'tool-invocation',
+        toolInvocation: { toolCallId: 't1', toolName: 'read_file', args: {}, state: 'result', result: 'ok' },
+      },
+      { type: 'text', text: 'The file says…' },
+      { type: 'reasoning', reasoning: 'Now I need to update it.' },
+      {
+        type: 'tool-invocation',
+        toolInvocation: { toolCallId: 't2', toolName: 'write_file', args: {}, state: 'result', result: 'ok' },
+      },
+      { type: 'text', text: 'Done.' },
+    ];
+    // The SDK's setMessages()→fillMessageParts()→getMessageParts() fallback
+    // for a from-DB message that has reasoning + content but no SDK
+    // `toolInvocations` field produces [reasoning, text] only — the broken
+    // state users saw after navigating back to a session.
+    const sdkBuiltFallback = [
+      { type: 'reasoning', reasoning: 'I should look at the file first.\nNow I need to update it.' },
+      { type: 'text', text: 'The file says…\nDone.' },
+    ];
+    const picked = pickMessageParts(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sdkBuiltFallback as any,
+      JSON.stringify(interleavedFromDB),
+    );
+    // Must NOT be the SDK's [reasoning, text] fallback — that would force
+    // the legacy render path and group the tool calls at the bottom.
+    expect(picked).toEqual(interleavedFromDB);
+    expect(picked.filter((p) => p.type === 'tool-invocation')).toHaveLength(2);
+  });
+
+  it('falls back to msg.parts when parts_raw is the literal empty array ("[]")', async () => {
+    const { pickMessageParts } = await import('../components/chat/helpers');
+    const liveParts = [{ type: 'text', text: 'streaming…' }];
+    const picked = pickMessageParts(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      liveParts as any,
+      '[]',
+    );
+    expect(picked).toBe(liveParts);
+  });
+
+  it('falls back to msg.parts when parts_raw is undefined (live, never persisted)', async () => {
+    const { pickMessageParts } = await import('../components/chat/helpers');
+    const liveParts = [{ type: 'text', text: 'streaming…' }];
+    const picked = pickMessageParts(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      liveParts as any,
+      undefined,
+    );
+    expect(picked).toBe(liveParts);
+  });
+
+  it('falls back to msg.parts when parts_raw is malformed JSON (defensive)', async () => {
+    const { pickMessageParts } = await import('../components/chat/helpers');
+    const liveParts = [{ type: 'text', text: 'streaming…' }];
+    const picked = pickMessageParts(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      liveParts as any,
+      'not-json-{',
+    );
+    expect(picked).toBe(liveParts);
+  });
+
+  it('returns an empty array when both parts_raw and msg.parts are absent', async () => {
+    const { pickMessageParts } = await import('../components/chat/helpers');
+    expect(pickMessageParts(undefined, undefined)).toEqual([]);
+    expect(pickMessageParts(undefined, '[]')).toEqual([]);
+  });
+
+  it('preserves part order from parts_raw: reasoning → tool → reasoning → text → tool → text', async () => {
+    const { pickMessageParts } = await import('../components/chat/helpers');
+    const ordered = [
+      { type: 'reasoning', reasoning: 'r1' },
+      { type: 'tool-invocation', toolInvocation: { toolCallId: 'a' } },
+      { type: 'reasoning', reasoning: 'r2' },
+      { type: 'text', text: 't1' },
+      { type: 'tool-invocation', toolInvocation: { toolCallId: 'b' } },
+      { type: 'text', text: 't2' },
+    ];
+    const picked = pickMessageParts(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      undefined as any,
+      JSON.stringify(ordered),
+    );
+    expect(picked.map((p: { type: string }) => p.type)).toEqual([
+      'reasoning',
+      'tool-invocation',
+      'reasoning',
+      'text',
+      'tool-invocation',
+      'text',
+    ]);
+  });
+});

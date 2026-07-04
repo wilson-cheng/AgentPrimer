@@ -13,7 +13,7 @@
 
 import { memo, useMemo } from 'react';
 import MessageBubble, { type LiveToolInvocation, type UIPart } from '@/components/MessageBubble';
-import { detectIncomplete } from './helpers';
+import { detectIncomplete, pickMessageParts } from './helpers';
 import type { ExtendedMessage } from './types';
 
 interface MessageRowProps {
@@ -48,25 +48,17 @@ export const MessageRow = memo(function MessageRow({
 }: MessageRowProps) {
   const isStreaming = isLast && isLoading && msg.role === 'assistant';
 
-  // Lazy-parse the historical parts blob. For chats with hundreds of tool
-  // calls this is the single biggest cost on session-load: previously every
-  // row's parts_json was JSON.parsed up front in loadSession, multiplied by
-  // every re-render through React.memo's stable input requirement. We keep
-  // the raw string on the row and parse here, behind useMemo.
-  const parsedHistoricalParts = useMemo<UIPart[]>(() => {
-    if (!msg.parts_raw) return [];
-    try {
-      const v = JSON.parse(msg.parts_raw);
-      return Array.isArray(v) ? (v as UIPart[]) : [];
-    } catch {
-      return [];
-    }
-  }, [msg.parts_raw]);
-
-  // Live messages from useChat already have a real `parts` array; only fall
-  // back to the parsed historical blob when the live one is absent/empty.
-  const partsForRender: UIPart[] =
-    msg.parts && msg.parts.length > 0 ? msg.parts : parsedHistoricalParts;
+  // Decide which `parts` to render. The DB's `parts_raw` snapshot is the
+  // authoritative source for the original reasoning/tool-call/text
+  // sequence — see the long comment on `pickMessageParts` for why the
+  // SDK's auto-generated `msg.parts` cannot be trusted for from-DB
+  // messages. `pickMessageParts` handles the parse + precedence rules and
+  // is memoised here so re-renders triggered by unrelated state don't
+  // re-parse the (potentially large) JSON.
+  const partsForRender: UIPart[] = useMemo(
+    () => pickMessageParts(msg.parts, msg.parts_raw),
+    [msg.parts, msg.parts_raw],
+  );
 
   const toolCalls = useMemo(() => {
     try {

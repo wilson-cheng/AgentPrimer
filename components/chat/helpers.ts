@@ -215,3 +215,49 @@ export function detectIncomplete(
   }
   return undefined;
 }
+
+/**
+ * Pick the `parts` array to render for a chat message.
+ *
+ * The AI SDK's `setMessages()` runs every message it receives through
+ * `fillMessageParts()` → `getMessageParts()`. For a message that arrives
+ * WITHOUT a `parts` field, `getMessageParts()` falls back to building one
+ * from `[toolInvocations, reasoning, content]` in that fixed order.
+ *
+ * From-DB messages come in with `parts_raw` (the persisted `parts_json`
+ * snapshot of the agent loop's `allParts`) but NO `parts` field. They
+ * also don't carry a `toolInvocations` field — that data lives in
+ * `tool_calls_json`. So the SDK's fallback reduces to `[reasoning, text]`
+ * and silently drops every interleaved tool-invocation.
+ *
+ * Downstream this is catastrophic: `useOrderedParts` in MessageBubble is
+ * driven by which part types are present, so the missing tool-invocations
+ * flip the message to the legacy fixed-order render path, which then
+ * renders reasoning → text at the top and groups all tool calls in a
+ * single `HistoricalToolsTrace` bubble at the BOTTOM of the message —
+ * the exact symptom users reported: "tool call bubbles are always at the
+ * bottom after navigating back to a session".
+ *
+ * The DB's `parts_raw` is the authoritative source for the original
+ * reasoning/tool-call/text sequence, so prefer it whenever it's
+ * populated. The fallback to `msg.parts` is still safe for live
+ * streaming because the agent loop initialises `parts_json` to `'[]'`
+ * and `mergeServerUpdates()` deliberately skips updating `parts_raw` for
+ * the in-flight message while `isLoading` is true — meaning
+ * `parsedHistoricalParts` is `[]` for the duration of the stream and
+ * the SDK's live `msg.parts` is used instead.
+ */
+export function pickMessageParts(
+  msgParts: UIPart[] | undefined,
+  partsRaw: string | undefined,
+): UIPart[] {
+  if (partsRaw) {
+    try {
+      const v = JSON.parse(partsRaw);
+      if (Array.isArray(v) && v.length > 0) return v as UIPart[];
+    } catch {
+      /* fall through to msg.parts */
+    }
+  }
+  return msgParts ?? [];
+}
