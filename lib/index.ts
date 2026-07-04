@@ -19,6 +19,7 @@ export {
   getSetting,
   setSetting,
   saveMessage,
+  deleteMessage,
   upsertAssistantMessage,
   touchSession,
   getSession,

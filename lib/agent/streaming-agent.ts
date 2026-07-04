@@ -25,9 +25,10 @@ import { buildSystemPrompt } from './prompt';
 import { resolveModelWithFallback } from './model-resolver';
 import { convertMessagesToOpenAI, compactConversation, buildMultimodalContent, ensureToolInvocations } from './messages';
 import { loadReasoning, clearReasoning } from './reasoning';
-import { buildIncompleteNotice } from './stream';
+import { buildIncompleteNotice, classifyStreamError } from './stream';
 import { runAgentLoop } from './loop';
-import type { AgentStepTrace, Attachment, TokenUsage, ToolSet } from './types';
+import { startRun, createTailResponse } from './run-manager';
+import type { AgentStepTrace, AgentStreamWriter, Attachment, TokenUsage, ToolSet } from './types';
 import type OpenAI from 'openai';
 
 export async function createStreamingAgent(params: {
@@ -40,6 +41,17 @@ export async function createStreamingAgent(params: {
   attachments?: Attachment[];
   /** Pre-allocated assistant message id for incremental persistence (see runAgentLoop). */
   assistantMessageId?: string;
+  /** Authenticated username scoping the detached run registry so one user can't
+   *  stop/inspect another's run. Only used on the detached path. */
+  user?: string | null;
+  /**
+   * When true (default), run the agent loop detached from the HTTP response so
+   * it survives a browser disconnect and can be stopped via /api/chat/stop.
+   * Set false for server-internal callers that consume the whole response
+   * themselves (the async sub-agent follow-up) — there's no browser to
+   * disconnect, so coupling the loop to the response is fine and simpler.
+   */
+  detached?: boolean;
   onFinish?: (
     text: string,
     toolCalls: unknown[],
@@ -49,7 +61,15 @@ export async function createStreamingAgent(params: {
     trace?: AgentStepTrace[],
   ) => void | Promise<void>;
 }): Promise<Response> {
-  const { agentName = MAIN_AGENT_NAME, modelId, onFinish, sessionId, assistantMessageId } = params;
+  const {
+    agentName = MAIN_AGENT_NAME,
+    modelId,
+    onFinish,
+    sessionId,
+    assistantMessageId,
+    user,
+    detached = true,
+  } = params;
 
   const config = getAgentConfig(agentName);
   const memory = readMemory(config.name);
@@ -241,93 +261,113 @@ export async function createStreamingAgent(params: {
     });
   }
 
+  // `runTurn` wraps `runAgentLoop` with the same error contract the old
+  // inline `execute` had: a throw from incidental post-success bookkeeping is
+  // swallowed, anything else becomes an incomplete-notice + finish so the
+  // assistant row is persisted with a resumable marker. Shared by both the
+  // detached (browser-facing) and non-detached (server-internal follow-up)
+  // execution paths.
+  const runTurn = async (writer: AgentStreamWriter, abortSignal?: AbortSignal): Promise<void> => {
+    // `loopSettled` flips true the moment `runAgentLoop` returns without
+    // throwing. After that point the assistant row has already been
+    // persisted (via `onFinish` inside the loop) and the success-side of
+    // the stream has been written; any later throw from incidental work
+    // (finalize-trace flush, reasoning persistence, the user's onFinish
+    // bookkeeping) must NOT be turned into an "incomplete" notice that
+    // overwrites the successful response.
+    let loopSettled = false;
+    try {
+      await runAgentLoop({
+        openai,
+        modelId: resolvedModel,
+        systemPrompt,
+        apiMessages,
+        tools: allTools,
+        maxSteps,
+        writer,
+        sessionId,
+        agentName,
+        assistantMessageId,
+        onFinish,
+        activatedSkills,
+        outputSchema: outputSchemaConfig,
+        abortSignal,
+      });
+      loopSettled = true;
+    } catch (err) {
+      if (loopSettled) {
+        console.warn(
+          '[agent] post-success bookkeeping failed (ignored):',
+          err instanceof Error ? err.message : err,
+        );
+        return;
+      }
+      const detail = err instanceof Error ? err.message : String(err);
+      const reason = classifyStreamError(detail, abortSignal);
+      const notice = buildIncompleteNotice(reason, detail);
+      try {
+        writer.write(formatDataStreamPart('text', notice));
+        writer.write(formatDataStreamPart('data', [{ type: 'incomplete', reason, detail }]));
+        writer.write(
+          formatDataStreamPart('finish_step', {
+            finishReason: reason === 'error' ? 'error' : 'unknown',
+            usage: { promptTokens: 0, completionTokens: 0 },
+            isContinued: false,
+          }),
+        );
+        writer.write(
+          formatDataStreamPart('finish_message', {
+            finishReason: reason === 'error' ? 'error' : 'unknown',
+            usage: { promptTokens: 0, completionTokens: 0 },
+          }),
+        );
+      } catch {
+        /* writer may already be closed */
+      }
+      if (onFinish) {
+        try {
+          await onFinish(
+            notice,
+            [],
+            { input: 0, cached: 0, output: 0 },
+            undefined,
+            [
+              { type: 'text', text: notice },
+              { type: 'incomplete-marker', reason, detail },
+            ],
+            undefined,
+          );
+        } catch (persistErr) {
+          console.warn('[agent] failed to persist incomplete state:', persistErr);
+        }
+      }
+      console.warn('[agent] runAgentLoop failed:', detail);
+    }
+  };
+
+  // ── Detached background run (browser-facing) ───────────────────────────
+  // The loop runs as a floating promise owned by the RunManager, writing to a
+  // replay buffer; the returned Response tails that buffer. Closing the browser
+  // only tears down the tail — the loop keeps going and keeps checkpointing, so
+  // a later reopen sees the result. `startRun` throws RUN_IN_PROGRESS if a run
+  // is already live for this session (the caller maps that to a 409).
+  if (detached && sessionId && assistantMessageId) {
+    const { run } = startRun({
+      owner: user,
+      sessionId,
+      assistantMessageId,
+      work: (writer, signal) => runTurn(writer, signal),
+    });
+    return createTailResponse(run);
+  }
+
+  // ── Coupled run (server-internal callers, e.g. the async sub-agent ─────
+  // follow-up) that consume the whole response via `response.text()`. There's
+  // no browser to disconnect and no Stop button, so tying the loop to the
+  // response stream is both fine and simpler.
   return createDataStreamResponse({
     execute: async (writer) => {
-      // `loopSettled` flips true the moment `runAgentLoop` returns without
-      // throwing. After that point the assistant row has already been
-      // persisted (via `onFinish` inside the loop) and the success-side of
-      // the stream has been written; any later throw from incidental work
-      // (finalize-trace flush, reasoning persistence, the user's onFinish
-      // bookkeeping) must NOT be turned into an "incomplete" notice that
-      // overwrites the successful response.
-      let loopSettled = false;
-      try {
-        await runAgentLoop({
-          openai,
-          modelId: resolvedModel,
-          systemPrompt,
-          apiMessages,
-          tools: allTools,
-          maxSteps,
-          writer,
-          sessionId,
-          agentName,
-          assistantMessageId,
-          onFinish,
-          activatedSkills,
-          outputSchema: outputSchemaConfig,
-        });
-        loopSettled = true;
-      } catch (err) {
-        if (loopSettled) {
-          console.warn(
-            '[agent] post-success bookkeeping failed (ignored):',
-            err instanceof Error ? err.message : err,
-          );
-          return;
-        }
-        const detail = err instanceof Error ? err.message : String(err);
-        const lower = detail.toLowerCase();
-        const looksLikeNetwork =
-          lower.includes('socket') ||
-          lower.includes('econn') ||
-          lower.includes('aborted') ||
-          lower.includes('timeout') ||
-          lower.includes('network') ||
-          lower.includes('eof') ||
-          lower.includes('reset') ||
-          lower.includes('disconnected') ||
-          lower.includes('terminated');
-        const reason: 'connection_lost' | 'error' = looksLikeNetwork ? 'connection_lost' : 'error';
-        const notice = buildIncompleteNotice(reason, detail);
-        try {
-          writer.write(formatDataStreamPart('text', notice));
-          writer.write(formatDataStreamPart('data', [{ type: 'incomplete', reason, detail }]));
-          writer.write(
-            formatDataStreamPart('finish_step', {
-              finishReason: reason === 'connection_lost' ? 'unknown' : 'error',
-              usage: { promptTokens: 0, completionTokens: 0 },
-              isContinued: false,
-            }),
-          );
-          writer.write(
-            formatDataStreamPart('finish_message', {
-              finishReason: reason === 'connection_lost' ? 'unknown' : 'error',
-              usage: { promptTokens: 0, completionTokens: 0 },
-            }),
-          );
-        } catch {
-          /* writer may already be closed */
-        }
-        if (onFinish) {
-          try {
-            await onFinish(
-              notice,
-              [],
-              { input: 0, cached: 0, output: 0 },
-              undefined,
-              [
-                { type: 'text', text: notice },
-                { type: 'incomplete-marker', reason, detail },
-              ],
-              undefined,
-            );
-          } catch (persistErr) {
-            console.warn('[agent] failed to persist incomplete state:', persistErr);
-          }
-        }
-        console.warn('[agent] runAgentLoop failed:', detail);
-      }
+      await runTurn(writer);
     },
     onError: (error) => (error instanceof Error ? error.message : String(error)),
   });

@@ -5,7 +5,7 @@
  * and have no runtime behavior.
  */
 import type { z } from 'zod';
-import type { JSONValue } from 'ai';
+import type { JSONValue, formatDataStreamPart } from 'ai';
 
 // ── Tool types ──────────────────────────────────────────────────────────────
 // AgentTool represents a single callable function exposed to the AI model.
@@ -21,6 +21,19 @@ export type AgentTool = {
 };
 
 export type ToolSet = Record<string, AgentTool>;
+
+// ── Stream writer ───────────────────────────────────────────────────────────
+// The exact wire-format string `formatDataStreamPart` produces — a tagged
+// template literal union like `0:"..."\n`, `b:{...}\n`, `d:{...}\n`. Typing
+// the writer against this (not plain `string`) keeps it compatible with the
+// AI SDK's `DataStreamWriter`, whose `write` accepts only this union. That
+// lets the loop write to either a real AI SDK response writer OR a
+// background-run buffer writer that implements the same surface.
+export type AgentStreamPart = ReturnType<typeof formatDataStreamPart>;
+
+export interface AgentStreamWriter {
+  write: (part: AgentStreamPart) => void;
+}
 
 // ── Token usage ─────────────────────────────────────────────────────────────
 export interface TokenUsage {

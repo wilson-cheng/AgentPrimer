@@ -23,6 +23,32 @@ export const LENGTH_FINISH_MESSAGE =
   '> ⚠️ Generation stopped because the model reached its maximum output token limit. The response may be incomplete. Increase the max output tokens or ask the model to continue from here.\n';
 
 /**
+ * Classify a stream/loop error into the incomplete-marker reason persisted
+ * alongside the assistant message. An explicit abort (Stop button) wins over
+ * the network-error heuristic so the UI shows "interrupted" + Continue rather
+ * than "connection lost". Shared by the loop's stream-iteration catch and the
+ * `runTurn` catch so the two copies of the string-matching heuristic can't drift.
+ */
+export function classifyStreamError(
+  detail: string,
+  abortSignal?: AbortSignal,
+): 'aborted' | 'connection_lost' | 'error' {
+  if (abortSignal?.aborted) return 'aborted';
+  const lower = detail.toLowerCase();
+  const looksLikeNetwork =
+    lower.includes('socket') ||
+    lower.includes('econn') ||
+    lower.includes('aborted') ||
+    lower.includes('timeout') ||
+    lower.includes('network') ||
+    lower.includes('eof') ||
+    lower.includes('reset') ||
+    lower.includes('disconnected') ||
+    lower.includes('terminated');
+  return looksLikeNetwork ? 'connection_lost' : 'error';
+}
+
+/**
  * Build a user-visible notice for an incomplete-stream condition.
  * `reason` is one of the well-known incomplete-marker reasons we persist
  * alongside the assistant message so the chat UI can surface a Continue

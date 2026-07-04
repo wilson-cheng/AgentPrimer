@@ -9,13 +9,12 @@
  * matches the schema. Nothing else.
  */
 import OpenAI from 'openai';
-import type { DataStreamWriter } from 'ai';
 import { formatDataStreamPart } from 'ai';
 import type { OutputSchema } from '../memory';
 import { getOutputLength } from '../model-lengths';
 import { normalizeTokenUsage } from './usage';
 import { toJSONValue } from './sanitize';
-import type { TokenUsage } from './types';
+import type { AgentStreamWriter, TokenUsage } from './types';
 
 /**
  * Build the system prompt for the finalize call.
@@ -118,10 +117,12 @@ export async function runFinalizeCall(args: {
   loopMsgs: OpenAI.Chat.ChatCompletionMessageParam[];
   finalText: string;
   schema: OutputSchema;
-  writer: DataStreamWriter;
+  writer: AgentStreamWriter;
   allParts: unknown[];
+  /** Abort signal from the RunManager — cancels the finalize HTTP call on Stop. */
+  signal?: AbortSignal;
 }): Promise<{ data: unknown; usage: TokenUsage }> {
-  const { openai, modelId, loopMsgs, finalText, schema, writer, allParts } = args;
+  const { openai, modelId, loopMsgs, finalText, schema, writer, allParts, signal } = args;
 
   const request = buildFinalizeRequest({ modelId, loopMsgs, finalText, schema });
 
@@ -146,6 +147,7 @@ export async function runFinalizeCall(args: {
       messages: request.messages,
       max_tokens: request.max_tokens,
       response_format: request.response_format,
+      ...(signal ? { signal } : {}),
     });
   } catch (err) {
     if (err instanceof OpenAI.APIError && (err.status === 400 || err.status === 422)) {
@@ -154,6 +156,7 @@ export async function runFinalizeCall(args: {
         model: request.model,
         messages: request.messages,
         max_tokens: request.max_tokens,
+        ...(signal ? { signal } : {}),
       });
     } else {
       throw err;

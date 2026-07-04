@@ -15,6 +15,7 @@ export type {
   ToolSet,
   TokenUsage,
   AgentStepTrace,
+  AgentStreamWriter,
   NormalizedToolCallDelta,
   NormalizedChatDelta,
   ThinkExtractorChunk,
@@ -88,6 +89,17 @@ export { createBuiltinTools, getBuiltinToolParameterSchemas } from './builtin-to
 
 // Loop
 export { runAgentLoop } from './loop';
+
+// Detached background-run manager (loop survives browser disconnect; Stop button)
+export {
+  startRun,
+  createTailResponse,
+  abortRun,
+  getActiveRun,
+  isSessionRunning,
+  RUN_IN_PROGRESS,
+  RUN_IN_PROGRESS_MESSAGE,
+} from './run-manager';
 
 // Public entry point
 export { createStreamingAgent } from './streaming-agent';

@@ -81,6 +81,12 @@ export default function ChatInterface({ initialSessionId }: Props) {
   const [settingsDefaultModel, setSettingsDefaultModel] = useState<string>('');
   const [sessionTitle, setSessionTitle] = useState('New Chat');
   const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
+  /** True when a detached background run is active for this session — i.e. the
+   *  agent loop is still going after the browser was closed/reopened (or the
+   *  live stream dropped). Drives the Stop button + Send gating on reopen and
+   *  a faster DB-merge poll so the assistant bubble updates as the run
+   *  checkpoints. See lib/agent/run-manager.ts. */
+  const [backgroundRunning, setBackgroundRunning] = useState(false);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const messagesContentRef = useRef<HTMLDivElement>(null);
   /**
@@ -569,11 +575,57 @@ export default function ChatInterface({ initialSessionId }: Props) {
 
   useEffect(() => {
     if (!sessionId || isLoading) return;
+    // While a detached background run is active, poll the DB merge faster so
+    // the assistant bubble updates as the loop checkpoints (every step). The
+    // normal 10s cadence is fine when idle.
+    const intervalMs = backgroundRunning ? 3000 : 10000;
     const timer = window.setInterval(() => {
       void mergeServerUpdates(sessionId).catch(() => {});
-    }, 10000);
+    }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [sessionId, isLoading, mergeServerUpdates]);
+  }, [sessionId, isLoading, backgroundRunning, mergeServerUpdates]);
+
+  // ── Background-run detection ───────────────────────────────────────────
+  // After a browser reopen mid-run (or a tab close in the same session), the
+  // useChat hook has no live fetch, so `isLoading` is false even though a
+  // detached run is still going on the server. We do a one-shot check on
+  // mount / session change / stream end (Effect A), and only spin up a
+  // continuous poll while a run is actually active (Effect B) so an idle tab
+  // doesn't poll forever.
+  const checkActive = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      const res = await fetch(`/api/chat/active?sessionId=${sessionId}`);
+      if (!res.ok) return;
+      const data = (await res.json()) as { active?: boolean };
+      setBackgroundRunning(!!data.active);
+    } catch {
+      /* ignore — transient network error */
+    }
+  }, [sessionId]);
+
+  // Effect A: one-shot detection on mount / session change / stream end.
+  useEffect(() => {
+    if (!sessionId) {
+      setBackgroundRunning(false);
+      return;
+    }
+    if (isLoading) {
+      setBackgroundRunning(false);
+      return;
+    }
+    void checkActive();
+  }, [sessionId, isLoading, checkActive]);
+
+  // Effect B: continuous poll ONLY while a background run is active, so we
+  // notice when it finishes and stop gating the UI.
+  useEffect(() => {
+    if (!sessionId || !backgroundRunning) return;
+    const timer = window.setInterval(() => {
+      void checkActive();
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [sessionId, backgroundRunning, checkActive]);
 
   // Persist agent choice when the user manually changes it
   useEffect(() => {
@@ -736,6 +788,14 @@ export default function ChatInterface({ initialSessionId }: Props) {
   // Start a brand-new conversation without creating a DB session yet.
   // The session is created lazily on the server when the first message is sent.
   const startNewSession = useCallback(() => {
+    // Detach the previous session's live tail (client fetch only). The detached
+    // server run keeps going and checkpoints to its own session row, so starting
+    // a new chat mid-inference doesn't leak the old stream into the new view.
+    try {
+      stop();
+    } catch {
+      /* no live fetch to abort */
+    }
     stickToBottomRef.current = true;
     setSessionId(uuidv4());
     setSessionTitle('New Conversation');
@@ -752,9 +812,19 @@ export default function ChatInterface({ initialSessionId }: Props) {
     processedPreviewRef.current = new Set();
     restoredPreviewStateRef.current = null;
     isRestoringRef.current = false;
-  }, [setMessages]);
+  }, [setMessages, stop]);
 
   const loadSession = async (id: string, preloadedTitle?: string, preloadedAgentName?: string) => {
+    // Detach the previous session's live tail WITHOUT aborting the server run
+    // (so `stop()`, not `handleStop`). The detached loop keeps going and
+    // checkpoints to the OLD session's DB row — switching away mid-inference
+    // must not leak its tokens into this view, and the result is visible when
+    // you switch back (the active-check + merge poll pick it up).
+    try {
+      stop();
+    } catch {
+      /* no live fetch to abort */
+    }
     stickToBottomRef.current = true;
     setSessionId(id);
     setHistoryLoaded(false);
@@ -1180,6 +1250,29 @@ export default function ChatInterface({ initialSessionId }: Props) {
     setShowScrollButton(false);
     pinToBottom();
   }, [pinToBottom]);
+
+  // ---------------------------------------------------------------------------
+  // Stop the active generation
+  // ---------------------------------------------------------------------------
+  // `stop` (from useChat) only kills the local fetch — which, now that the
+  // loop runs detached, would merely detach the browser tail and leave the
+  // run going in the background. So we ALSO POST /api/chat/stop to abort the
+  // server-side run. Works both for a live stream (isLoading) and for a
+  // background run reopened in a new tab (backgroundRunning).
+  const handleStop = useCallback(() => {
+    try {
+      stop();
+    } catch {
+      /* no live fetch to abort */
+    }
+    if (sessionId) {
+      fetch('/api/chat/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId }),
+      }).catch(() => {});
+    }
+  }, [sessionId, stop]);
 
   // ---------------------------------------------------------------------------
   // Handle sending a message
@@ -1766,6 +1859,17 @@ export default function ChatInterface({ initialSessionId }: Props) {
                 </div>
               </div>
             )}
+
+            {/* Background-run indicator: a detached run is still going on the
+                server (e.g. the browser was reopened mid-generation). There's
+                no live stream here, so the assistant bubble updates via the DB
+                merge poll. Surfaces a visible "still working" signal + Stop. */}
+            {backgroundRunning && !isLoading && (
+              <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400 pl-11">
+                <span className="inline-block h-2 w-2 rounded-full bg-blue-400 animate-pulse" />
+                Generating in background…
+              </div>
+            )}
           </div>
 
           <div ref={scrollAnchorRef} aria-hidden="true" className="h-px w-full" />
@@ -1796,8 +1900,8 @@ export default function ChatInterface({ initialSessionId }: Props) {
         {/* Chat input */}
         <ChatInput
           onSend={handleSend}
-          onStop={isLoading ? stop : undefined}
-          disabled={isLoading || !sessionId}
+          onStop={isLoading || backgroundRunning ? handleStop : undefined}
+          disabled={isLoading || backgroundRunning || !sessionId}
           placeholder={`Message ${agentName === 'main' ? 'AgentPrimer' : agentName}…`}
         />
       </main>

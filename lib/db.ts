@@ -534,6 +534,12 @@ export function saveMessage(msg: Omit<Message, 'created_at'>): void {
   recordAssistantTokenUsage(msg);
 }
 
+/** Delete a single message row by id. Used to roll back a just-saved user
+ *  message when a run loses the one-active-run race (see app/api/chat/route.ts). */
+export function deleteMessage(id: string): void {
+  getDb().prepare('DELETE FROM messages WHERE id = ?').run(id);
+}
+
 /**
  * Append-only token usage log writer. Idempotent on `id` (uses INSERT OR
  * IGNORE) so callers can safely invoke it multiple times for the same row —

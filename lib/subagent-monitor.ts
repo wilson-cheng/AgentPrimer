@@ -96,6 +96,11 @@ async function runParentFollowup(args: {
       agentName: task?.assigner,
       messages: [...stored, { role: 'user', content: prompt }],
       sessionId: args.sessionId,
+      // Server-internal follow-up: consumed via `response.text()`, no browser
+      // to disconnect and no Stop button. Coupling the loop to the response
+      // (instead of the detached RunManager) avoids a singleton collision with
+      // any user-initiated run on the same session.
+      detached: false,
       onFinish: async (
         text: string,
         toolCalls: unknown[],

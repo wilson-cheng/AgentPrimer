@@ -19,9 +19,16 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { formatDataStreamPart } from 'ai';
-import { createStreamingAgent } from '@/lib/agent';
+import {
+  createStreamingAgent,
+  isSessionRunning,
+  RUN_IN_PROGRESS,
+  RUN_IN_PROGRESS_MESSAGE,
+} from '@/lib/agent';
+import { getSessionUser } from '@/lib/auth';
 import {
   saveMessage,
+  deleteMessage,
   touchSession,
   getSession,
   updateSessionTitle,
@@ -31,7 +38,13 @@ import {
 import { v4 as uuidv4 } from 'uuid';
 
 export const runtime = 'nodejs'; // Required: we use Node.js APIs (fs, sqlite, child_process)
-export const maxDuration = 120; // Allow up to 2 minutes for long agent runs
+// The agent loop now runs detached from this HTTP response (see
+// lib/agent/run-manager.ts), so a run can outlive a single request. We still
+// keep the request open as long as practical so the browser receives live
+// tokens; beyond this wall-clock cap the live tail closes and the frontend's
+// 10s merge poll takes over from the SQLite checkpoints. The run itself is
+// bounded by `max_agent_steps`, NOT by this value.
+export const maxDuration = 600;
 
 /**
  * AI SDK data-stream keep-alive heartbeat.
@@ -208,6 +221,25 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'sessionId and messages are required' }, { status: 400 });
   }
 
+  // Authenticated username — scopes the detached run registry so one user can't
+  // start/stop/inspect another user's run. proxy.ts enforces a valid JWT, so
+  // this should always resolve; guard defensively.
+  const user = await getSessionUser();
+  if (!user) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  // ── One active background run per (user, session) (queue is deferred) ───
+  // A second turn while a run is still live would race on the same
+  // workspace/assistant row. The frontend disables Send while a run is
+  // active, but this server-side guard is authoritative and also catches the
+  // reopen-mid-run case where the user can type before the UI catches up.
+  // Checked BEFORE saving the user message so a rejected turn leaves no
+  // dangling user row.
+  if (isSessionRunning(user, sessionId)) {
+    return NextResponse.json({ error: RUN_IN_PROGRESS_MESSAGE }, { status: 409 });
+  }
+
   // ── Detect resume requests (BEFORE any mutation) ───────────────────────
   // Two paths reach here as a "continue":
   //   1. The frontend Continue button sets resumeFrom=true explicitly.
@@ -233,6 +265,12 @@ export async function POST(request: NextRequest) {
   const userMessages = messages.filter((m) => m.role === 'user');
   const lastUserMessage = userMessages[userMessages.length - 1];
 
+  // Tracked so the RUN_IN_PROGRESS race catch can roll it back. The early
+  // isSessionRunning check is BEFORE this save, but startRun (inside
+  // createStreamingAgent, further down) re-checks atomically; if it loses the
+  // race we must not leave a dangling user row.
+  let savedUserMessageId: string | undefined;
+
   // Save the user message to the database FIRST, while messages still hold
   // the user's original text. Mutation for the LLM happens after this block.
   if (lastUserMessage) {
@@ -254,17 +292,19 @@ export async function POST(request: NextRequest) {
         ? lastUserMessage.content
         : JSON.stringify(lastUserMessage.content);
 
+    // Reuse the client-supplied message id (allocated by the AI SDK's useChat
+    // hook) when present so the row in the DB shares an id with the user
+    // message already rendered on the client. Without this the post-stream
+    // merge would treat the persisted row as new and render a duplicate user
+    // bubble. Falls back to a fresh UUID for legacy clients that don't send
+    // `sendExtraMessageFields`.
+    const userMessageId =
+      typeof lastUserMessage.id === 'string' && lastUserMessage.id
+        ? lastUserMessage.id
+        : uuidv4();
+    savedUserMessageId = userMessageId;
     saveMessage({
-      // Reuse the client-supplied message id (allocated by the AI SDK's
-      // useChat hook) when present so the row in the DB shares an id with
-      // the user message already rendered on the client. Without this the
-      // post-stream merge would treat the persisted row as new and render
-      // a duplicate user bubble. Falls back to a fresh UUID for legacy
-      // clients that don't send `sendExtraMessageFields`.
-      id:
-        typeof lastUserMessage.id === 'string' && lastUserMessage.id
-          ? lastUserMessage.id
-          : uuidv4(),
+      id: userMessageId,
       session_id: sessionId,
       role: 'user',
       content: persistedContent,
@@ -320,31 +360,54 @@ export async function POST(request: NextRequest) {
   // Start the streaming agent – returns a Response with the AI data stream.
   // We wrap it to add no-buffering headers so that VS Code port-forwarding /
   // any nginx/proxy in front of the dev server does not batch up SSE chunks.
-  const agentResponse = await createStreamingAgent({
-    agentName,
-    modelId,
-    messages,
-    sessionId,
-    attachments,
-    assistantMessageId,
-    onFinish: async (text, toolCalls, tokenUsage, reasoning, parts, trace) => {
-      // Final assistant write — overwrites any checkpoint rows written during
-      // the run so the persisted state matches what `onFinish` reports.
-      upsertAssistantMessage({
-        id: assistantMessageId,
-        session_id: sessionId,
-        role: 'assistant',
-        content: text,
-        attachments_json: '[]',
-        tool_calls_json: JSON.stringify(toolCalls),
-        token_usage_json: tokenUsage ? JSON.stringify(tokenUsage) : '{}',
-        reasoning_json: reasoning ?? '',
-        parts_json: JSON.stringify(parts ?? []),
-        trace_json: trace ? JSON.stringify(trace) : '[]',
-      });
-      touchSession(sessionId);
-    },
-  });
+  // The loop now runs detached (lib/agent/run-manager.ts): `agentResponse`
+  // is a tail of the run's replay buffer, so a client disconnect only tears
+  // down this tail, not the run itself.
+  let agentResponse: Response;
+  try {
+    agentResponse = await createStreamingAgent({
+      agentName,
+      modelId,
+      messages,
+      sessionId,
+      attachments,
+      assistantMessageId,
+      user,
+      detached: true,
+      onFinish: async (text, toolCalls, tokenUsage, reasoning, parts, trace) => {
+        // Final assistant write — overwrites any checkpoint rows written during
+        // the run so the persisted state matches what `onFinish` reports.
+        upsertAssistantMessage({
+          id: assistantMessageId,
+          session_id: sessionId,
+          role: 'assistant',
+          content: text,
+          attachments_json: '[]',
+          tool_calls_json: JSON.stringify(toolCalls),
+          token_usage_json: tokenUsage ? JSON.stringify(tokenUsage) : '{}',
+          reasoning_json: reasoning ?? '',
+          parts_json: JSON.stringify(parts ?? []),
+          trace_json: trace ? JSON.stringify(trace) : '[]',
+        });
+        touchSession(sessionId);
+      },
+    });
+  } catch (err) {
+    // Backstop for the rare race between the early `isSessionRunning` check
+    // above and `startRun` inside createStreamingAgent. Roll back the user
+    // message we already saved so a lost race leaves no dangling row.
+    if (err instanceof Error && err.message === RUN_IN_PROGRESS) {
+      if (savedUserMessageId) {
+        try {
+          deleteMessage(savedUserMessageId);
+        } catch {
+          /* best-effort */
+        }
+      }
+      return NextResponse.json({ error: RUN_IN_PROGRESS_MESSAGE }, { status: 409 });
+    }
+    throw err;
+  }
 
   const headers = new Headers(agentResponse.headers);
   headers.set('X-Accel-Buffering', 'no'); // nginx: disable proxy buffering

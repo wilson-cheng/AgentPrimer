@@ -20,7 +20,7 @@
  */
 import OpenAI from 'openai';
 import { formatDataStreamPart } from 'ai';
-import type { DataStreamWriter, JSONValue } from 'ai';
+import type { JSONValue } from 'ai';
 import type { OutputSchema } from '../memory';
 import { upsertAssistantMessage, getSetting } from '../db';
 import { getOutputLength } from '../model-lengths';
@@ -28,6 +28,7 @@ import { createAgentTrace, endGeneration, finalizeTrace, startGeneration } from 
 import { toolsToOpenAIFormat } from './schema';
 import {
   buildIncompleteNotice,
+  classifyStreamError,
   createThinkExtractor,
   LENGTH_FINISH_MESSAGE,
   normalizeChatCompletionChunk,
@@ -45,7 +46,7 @@ import { normalizeTokenUsage } from './usage';
 import { saveReasoning, clearReasoning, persistReasoning } from './reasoning';
 import { isVisionRejectionError, stripMultimodalFromMsgs } from './messages';
 import { runFinalizeCall } from './finalize';
-import type { AgentStepTrace, ToolSet, TokenUsage } from './types';
+import type { AgentStepTrace, AgentStreamWriter, ToolSet, TokenUsage } from './types';
 
 export async function runAgentLoop(params: {
   openai: OpenAI;
@@ -54,7 +55,7 @@ export async function runAgentLoop(params: {
   apiMessages: OpenAI.Chat.ChatCompletionMessageParam[];
   tools: ToolSet;
   maxSteps: number;
-  writer: DataStreamWriter;
+  writer: AgentStreamWriter;
   sessionId?: string;
   agentName?: string;
   /**
@@ -64,6 +65,15 @@ export async function runAgentLoop(params: {
    * multi-tool run does not lose the work that has already been done.
    */
   assistantMessageId?: string;
+  /**
+   * Abort signal owned by the RunManager. Fires ONLY when the user clicks
+   * Stop (never on a browser/socket disconnect, because the loop now runs
+   * detached from the HTTP response). Passed to each `openai.create` call so
+   * the in-flight LLM request is cancelled, and checked at the top of every
+   * step so a cancel that lands between steps exits cleanly without firing
+   * another LLM request.
+   */
+  abortSignal?: AbortSignal;
   onFinish?: (
     text: string,
     toolCalls: unknown[],
@@ -92,6 +102,7 @@ export async function runAgentLoop(params: {
     sessionId,
     agentName,
     assistantMessageId,
+    abortSignal,
     onFinish,
     activatedSkills,
     outputSchema,
@@ -187,6 +198,32 @@ export async function runAgentLoop(params: {
     // ── One-shot schema-agent short-circuit ─────────────────────────────
     if (step === 0 && outputSchema && Object.keys(tools).length === 0) break;
 
+    // ── Explicit cancel (Stop button) ───────────────────────────────────
+    // The in-flight LLM call is aborted via `signal` further down; this guard
+    // catches a cancel that lands between steps (e.g. during a long tool
+    // execution) so we exit without firing another LLM request. We emit an
+    // 'aborted' notice + marker + finish_step, then break and let the normal
+    // post-loop path emit the single `finish_message` and persist via
+    // `onFinish`.
+    if (abortSignal?.aborted) {
+      const notice = buildIncompleteNotice('aborted');
+      totalText += notice;
+      allParts.push({ type: 'text', text: notice });
+      allParts.push({ type: 'incomplete-marker', reason: 'aborted' });
+      writer.write(formatDataStreamPart('text', notice));
+      writer.write(formatDataStreamPart('data', [{ type: 'incomplete', reason: 'aborted' }]));
+      finalFinishReason = 'aborted';
+      writer.write(
+        formatDataStreamPart('finish_step', {
+          finishReason: toSdkFinishReason('aborted'),
+          usage: { promptTokens: 0, completionTokens: 0 },
+          isContinued: false,
+        }),
+      );
+      checkpoint(true);
+      break;
+    }
+
     const stepStartTime = tracingEnabled ? Date.now() : 0;
     const requestSnapshot = {
       model: modelId,
@@ -221,6 +258,7 @@ export async function runAgentLoop(params: {
         ...(openaiTools ? { tools: openaiTools, tool_choice: 'auto' } : {}),
         stream: true,
         stream_options: { include_usage: true },
+        ...(abortSignal ? { signal: abortSignal } : {}),
       });
     } catch (err) {
       if (
@@ -244,6 +282,7 @@ export async function runAgentLoop(params: {
             ...(openaiTools ? { tools: openaiTools, tool_choice: 'auto' } : {}),
             stream: true,
             stream_options: { include_usage: true },
+            ...(abortSignal ? { signal: abortSignal } : {}),
           });
         } else {
           throw err;
@@ -277,7 +316,7 @@ export async function runAgentLoop(params: {
     };
 
     // ── 2. Process each streaming chunk ────────────────────────────────────
-    let streamInterrupted: { reason: 'connection_lost' | 'error'; detail: string } | undefined;
+    let streamInterrupted: { reason: 'connection_lost' | 'error' | 'aborted'; detail: string } | undefined;
     try {
       for await (const chunk of stream) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -341,19 +380,8 @@ export async function runAgentLoop(params: {
       }
     } catch (streamErr) {
       const detail = streamErr instanceof Error ? streamErr.message : String(streamErr);
-      const lower = detail.toLowerCase();
-      const looksLikeNetwork =
-        lower.includes('socket') ||
-        lower.includes('econn') ||
-        lower.includes('aborted') ||
-        lower.includes('timeout') ||
-        lower.includes('network') ||
-        lower.includes('eof') ||
-        lower.includes('reset') ||
-        lower.includes('disconnected') ||
-        lower.includes('terminated');
       streamInterrupted = {
-        reason: looksLikeNetwork ? 'connection_lost' : 'error',
+        reason: classifyStreamError(detail, abortSignal),
         detail,
       };
       console.warn('[agent] stream interrupted mid-response:', detail);
@@ -436,10 +464,10 @@ export async function runAgentLoop(params: {
       });
       let stepFinishReason = finishReason;
       let incompleteMarker:
-        { reason: 'length' | 'connection_lost' | 'error'; detail?: string } | undefined;
+        | { reason: 'length' | 'connection_lost' | 'error' | 'aborted'; detail?: string }
+        | undefined;
       if (streamInterrupted) {
-        stepFinishReason =
-          streamInterrupted.reason === 'connection_lost' ? 'connection_lost' : 'error';
+        stepFinishReason = streamInterrupted.reason;
         incompleteMarker = { reason: streamInterrupted.reason, detail: streamInterrupted.detail };
         const notice = stepText
           ? `\n\n${buildIncompleteNotice(streamInterrupted.reason, streamInterrupted.detail)}`
@@ -693,7 +721,12 @@ export async function runAgentLoop(params: {
   }
 
   // ── 4.5. Finalize call for structured-output agents ─────────────────────
-  if (outputSchema) {
+  // Skipped on an explicit abort: the abort already emitted its own
+  // finish_step + 'aborted' marker in the break path above, so running the
+  // finalize call (whose `openai.create({signal})` would throw AbortError)
+  // would otherwise skip the normal post-loop finish_message and let runTurn's
+  // catch emit a second finish_step + a wrong 'connection_lost' marker.
+  if (outputSchema && !abortSignal?.aborted) {
     const finalize = await runFinalizeCall({
       openai,
       modelId,
@@ -702,6 +735,7 @@ export async function runAgentLoop(params: {
       schema: outputSchema,
       writer,
       allParts,
+      ...(abortSignal ? { signal: abortSignal } : {}),
     });
     totalUsage.input += finalize.usage.input;
     totalUsage.cached += finalize.usage.cached;
