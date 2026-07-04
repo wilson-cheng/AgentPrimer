@@ -270,6 +270,15 @@ function migrate(db: Database.Database): void {
   if (!msgCols.includes('trace_json')) {
     db.exec("ALTER TABLE messages ADD COLUMN trace_json TEXT NOT NULL DEFAULT '[]'");
   }
+  // `has_trace` is a cheap 0/1 flag for "this message has a non-empty trace".
+  // The list readers (getMessagesPage/getMessagesAfter) select it INSTEAD of
+  // trace_json — SQLite length(trace_json) would scan the (potentially
+  // multi-MB) trace on every read/poll, so we persist the flag at write time.
+  if (!msgCols.includes('has_trace')) {
+    db.exec('ALTER TABLE messages ADD COLUMN has_trace INTEGER NOT NULL DEFAULT 0');
+    // One-time backfill for rows written before this column existed.
+    db.exec('UPDATE messages SET has_trace = 1 WHERE length(trace_json) > 2');
+  }
 
   // Index on `session_id` — this is the hot path for the chat UI. Every
   // paginated read (`/api/messages`), the 10s polling cursor, the
@@ -481,15 +490,32 @@ export interface Message {
   token_usage_json: string;
   reasoning_json: string;
   parts_json: string;
-  trace_json: string;
+  /** Persisted per-step trace. Omitted from list reads (getMessagesPage /
+   *  getMessagesAfter) to keep responses small — fetched lazily via
+   *  /api/messages/trace. Still present on write paths (saveMessage /
+   *  upsertAssistantMessage) and on the full getMessages() read. */
+  trace_json?: string;
+  /** 0/1 — whether trace_json is non-empty (length > 2). Cheap surrogate so
+   *  the UI can show the "Trace" button without loading the (potentially
+   *  multi-MB) trace. Populated by the list-read queries and written at
+   *  message-save time (saveMessage/upsertAssistantMessage). */
+  has_trace?: number;
   created_at: number;
+}
+
+/** 0/1 — whether a trace_json string is non-empty (longer than the empty
+ *  `'[]'`). Computed from the V8 string length (O(1)) at write time so the
+ *  list readers can select the persisted `has_trace` column instead of
+ *  scanning the (potentially multi-MB) trace with SQLite length(). */
+function traceHasContent(traceJson: string | undefined | null): number {
+  return !!traceJson && traceJson.length > 2 ? 1 : 0;
 }
 
 export function saveMessage(msg: Omit<Message, 'created_at'>): void {
   const db = getDb();
   db.prepare(
-    `INSERT INTO messages (id, session_id, role, content, attachments_json, tool_calls_json, token_usage_json, reasoning_json, parts_json, trace_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO messages (id, session_id, role, content, attachments_json, tool_calls_json, token_usage_json, reasoning_json, parts_json, trace_json, has_trace)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.session_id,
@@ -501,6 +527,7 @@ export function saveMessage(msg: Omit<Message, 'created_at'>): void {
     msg.reasoning_json ?? '',
     msg.parts_json ?? '[]',
     msg.trace_json ?? '[]',
+    traceHasContent(msg.trace_json),
   );
 
   // Also write to the persistent token usage log so stats survive message/session deletion
@@ -549,8 +576,8 @@ function recordAssistantTokenUsage(msg: Omit<Message, 'created_at'>): void {
 export function upsertAssistantMessage(msg: Omit<Message, 'created_at'>): void {
   const db = getDb();
   db.prepare(
-    `INSERT INTO messages (id, session_id, role, content, attachments_json, tool_calls_json, token_usage_json, reasoning_json, parts_json, trace_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO messages (id, session_id, role, content, attachments_json, tool_calls_json, token_usage_json, reasoning_json, parts_json, trace_json, has_trace)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        content          = excluded.content,
        attachments_json = excluded.attachments_json,
@@ -558,7 +585,8 @@ export function upsertAssistantMessage(msg: Omit<Message, 'created_at'>): void {
        token_usage_json = excluded.token_usage_json,
        reasoning_json   = excluded.reasoning_json,
        parts_json       = excluded.parts_json,
-       trace_json       = excluded.trace_json`,
+       trace_json       = excluded.trace_json,
+       has_trace        = excluded.has_trace`,
   ).run(
     msg.id,
     msg.session_id,
@@ -570,6 +598,7 @@ export function upsertAssistantMessage(msg: Omit<Message, 'created_at'>): void {
     msg.reasoning_json ?? '',
     msg.parts_json ?? '[]',
     msg.trace_json ?? '[]',
+    traceHasContent(msg.trace_json),
   );
   recordAssistantTokenUsage(msg);
 }
@@ -608,6 +637,22 @@ export function countMessages(sessionId: string): number {
  *     (already indexed as the primary key for `INTEGER PRIMARY KEY` tables;
  *     for our TEXT primary key it's still maintained as the implicit rowid).
  */
+/**
+ * Columns returned by the paginated message readers (getMessagesPage /
+ * getMessagesAfter). `trace_json` is deliberately EXCLUDED: a single
+ * multi-step assistant message can persist a multi-MB trace (the full
+ * conversation snapshotted at every agent step), and returning it on every
+ * session-load / 10s poll was the root cause of the large-session slowdown.
+ * The UI gets the persisted `has_trace` flag (written at message-save time,
+ * so reading it is O(1) — unlike length(trace_json), which scans the blob)
+ * and fetches the trace on demand via /api/messages/trace when the Trace
+ * Drawer opens.
+ */
+const MESSAGE_LIST_COLUMNS =
+  'id, session_id, role, content, attachments_json, tool_calls_json, ' +
+  'token_usage_json, reasoning_json, parts_json, created_at, ' +
+  'has_trace, rowid AS _rowid';
+
 export function getMessagesPage(
   sessionId: string,
   limit: number,
@@ -625,14 +670,14 @@ export function getMessagesPage(
   const rows = hasCursor
     ? (db
         .prepare(
-          `SELECT *, rowid AS _rowid FROM messages
+          `SELECT ${MESSAGE_LIST_COLUMNS} FROM messages
          WHERE session_id = ? AND rowid < ?
          ORDER BY rowid DESC LIMIT ?`,
         )
         .all(sessionId, before, cap + 1) as Array<Message & { _rowid: number }>)
     : (db
         .prepare(
-          `SELECT *, rowid AS _rowid FROM messages
+          `SELECT ${MESSAGE_LIST_COLUMNS} FROM messages
          WHERE session_id = ?
          ORDER BY rowid DESC LIMIT ?`,
         )
@@ -659,11 +704,24 @@ export function getMessagesAfter(
   const cap = Math.max(1, Math.min(limit, 500));
   return getDb()
     .prepare(
-      `SELECT *, rowid AS _rowid FROM messages
+      `SELECT ${MESSAGE_LIST_COLUMNS} FROM messages
      WHERE session_id = ? AND rowid > ?
      ORDER BY rowid ASC LIMIT ?`,
     )
     .all(sessionId, after, cap) as Array<Message & { _rowid: number }>;
+}
+
+/**
+ * Return the full `trace_json` for a single message. Used by the lazy-load
+ * endpoint (/api/messages/trace) so the Trace Drawer fetches a trace only
+ * when the user actually opens it — instead of every message carrying its
+ * (potentially multi-MB) trace on every session-load / poll.
+ */
+export function getMessageTrace(messageId: string): string | null {
+  const row = getDb().prepare('SELECT trace_json FROM messages WHERE id = ?').get(messageId) as
+    | { trace_json: string }
+    | undefined;
+  return row?.trace_json ?? null;
 }
 
 // ---------------------------------------------------------------------------

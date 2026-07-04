@@ -238,6 +238,56 @@ export function compactConversation(
   return apiMessages.filter((_, i) => keepIndices.has(i));
 }
 
+// ── Tool-invocation reconstruction for from-DB messages ───────────────────
+
+/**
+ * Ensure every assistant message carries a `toolInvocations` array that
+ * `convertMessagesToOpenAI` can read.
+ *
+ * Messages restored from the database (via /api/messages → loadSession) carry
+ * the persisted `tool_calls_json` string but NOT the live `toolInvocations`
+ * array that the SDK populates for in-session messages. Without this
+ * normalization, `convertMessagesToOpenAI` sees no tool calls for those
+ * messages and silently drops every tool call + tool result from the history
+ * sent to the LLM — so after switching away from a session and coming back,
+ * the agent "forgets" everything it did with tools.
+ *
+ * We reconstruct `toolInvocations` from `tool_calls_json` (the flat
+ * `{toolCallId, toolName, args, result}` list persisted by the agent loop).
+ * Step grouping is collapsed to a single step because the persisted list does
+ * not retain per-step boundaries; that is valid for the OpenAI API and far
+ * better than losing the tool history entirely.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function ensureToolInvocations(messages: any[]): any[] {
+  return messages.map((msg) => {
+    if (msg.role !== 'assistant') return msg;
+    if (Array.isArray(msg.toolInvocations) && msg.toolInvocations.length > 0) return msg;
+    const raw = msg.tool_calls_json;
+    if (typeof raw !== 'string' || raw.length === 0) return msg;
+    let list: unknown;
+    try {
+      list = JSON.parse(raw);
+    } catch {
+      return msg;
+    }
+    if (!Array.isArray(list) || list.length === 0) return msg;
+    return {
+      ...msg,
+      toolInvocations: list
+        .filter((t): t is Record<string, unknown> => !!t && typeof t === 'object')
+        .map((t) => ({
+          toolCallId: t.toolCallId,
+          toolName: t.toolName,
+          args: t.args,
+          result: t.result,
+          state: 'result',
+          step: 0,
+        })),
+    };
+  });
+}
+
 // ── Multimodal fallback helpers ────────────────────────────────────────────
 
 /**

@@ -46,8 +46,10 @@ import { MessageRow } from '@/components/chat/MessageRow';
 import { INITIAL_PAGE_SIZE, OLDER_PAGE_SIZE } from '@/components/chat/constants';
 import {
   getActionMenuPosition,
-  parseJsonArray,
   toExtendedMessage,
+  buildChatRequestBody,
+  applyStoredFields,
+  storedFieldsEqual,
 } from '@/components/chat/helpers';
 import { ALL_SUGGESTIONS } from '@/components/chat/suggestions';
 import type {
@@ -229,6 +231,29 @@ export default function ChatInterface({ initialSessionId }: Props) {
   // Vercel AI SDK useChat hook
   // Manages message state + streaming connection to /api/chat
   // ---------------------------------------------------------------------------
+  // Build a TRIMMED request body on every send. The default behaviour
+  // (`sendExtraMessageFields`) serializes the entire message objects —
+  // including `trace_json`, which snapshots the whole conversation at every
+  // agent step and can reach tens of MB for a long session. That turned a
+  // "hi" follow-up into a 15MB+ POST that crashed the browser and made the
+  // server's `request.json()` reject with a 400 "Invalid request body". The
+  // server only needs id/role/content/toolInvocations (+ tool_calls_json for
+  // from-DB messages), so `buildChatRequestBody` drops everything else.
+  // Recreated only when the session/agent/model change so `append` stays
+  // referentially stable between turns.
+  const prepareChatRequestBody = useCallback(
+    (options: { id: string; messages: Parameters<typeof buildChatRequestBody>[0]['messages']; requestBody?: object }) =>
+      buildChatRequestBody({
+        id: options.id,
+        messages: options.messages,
+        requestBody: options.requestBody,
+        sessionId,
+        agentName,
+        modelId,
+      }),
+    [sessionId, agentName, modelId],
+  );
+
   const {
     messages,
     append,
@@ -239,15 +264,13 @@ export default function ChatInterface({ initialSessionId }: Props) {
     data: streamData,
   } = useChat({
     api: '/api/chat',
-    // Forward the SDK-allocated message id (and other extra fields) along
-    // with each request so the server can persist user messages under the
-    // same id the client is already rendering. Without this the SDK strips
-    // `id` from the request body and the DB row gets a fresh UUID, which
-    // then arrives back through `mergeServerUpdates` as a "new" message
-    // and produces a duplicated user bubble after the first turn.
-    sendExtraMessageFields: true,
-    // Pass extra data (sessionId, agentName, modelId) alongside every request
-    body: { sessionId, agentName, modelId: modelId || undefined },
+    // `prepareChatRequestBody` builds a minimal wire payload (id/role/content/
+    // toolInvocations + the per-call body) so the multi-MB UI-only fields
+    // (trace_json, parts, reasoning, …) never reach /api/chat. It also
+    // forwards each message id so the server persists user messages under the
+    // same id the client renders (otherwise the DB row gets a fresh UUID that
+    // arrives back as a "new" message → duplicated user bubble).
+    experimental_prepareRequestBody: prepareChatRequestBody,
     onFinish: () => {
       // Notify sidebar to refresh session list (title may have changed)
       window.dispatchEvent(new Event('sessions-changed'));
@@ -339,6 +362,7 @@ export default function ChatInterface({ initialSessionId }: Props) {
           }
           if (traceData) {
             (newMsg as unknown as { trace_json: string }).trace_json = JSON.stringify(traceData);
+            (newMsg as unknown as { hasTrace: boolean }).hasTrace = true;
           }
           // Push our custom data events onto msg.data so MessageBubble's
           // `soFromData` / `finalizeFromData` selectors (which scan
@@ -462,24 +486,18 @@ export default function ChatInterface({ initialSessionId }: Props) {
           // every poll allocates fresh refs for every row in the head page,
           // forcing React.memo on MessageRow to discard its bailout and
           // re-render every visible message twice a minute.
-          const samePersistedFields =
-            existing.content === row.content &&
-            (existing.token_usage_json ?? '{}') === (row.token_usage_json || '{}') &&
-            (existing.tool_calls_json ?? '[]') === (row.tool_calls_json || '[]') &&
-            (existing.reasoning ?? '') === (row.reasoning_json || '') &&
-            (existing.parts_raw ?? '[]') === (row.parts_json || '[]') &&
-            (existing.trace_json ?? '[]') === (row.trace_json || '[]');
-          if (samePersistedFields) continue;
-          const merged: ExtendedMessage = {
-            ...existing,
-            content: row.content,
-            experimental_attachments: parseJsonArray<Attachment>(row.attachments_json),
-            token_usage_json: row.token_usage_json || '{}',
-            tool_calls_json: row.tool_calls_json || '[]',
-            reasoning: row.reasoning_json || '',
-            parts_raw: row.parts_json || '[]',
-            trace_json: row.trace_json || '[]',
-          };
+          // Bail out when none of the persisted-only fields differ. This
+          // matters for the 10-second polling effect: without this guard
+          // every poll allocates fresh refs for every row in the head page,
+          // forcing React.memo on MessageRow to discard its bailout and
+          // re-render every visible message twice a minute.
+          if (storedFieldsEqual(existing, row)) continue;
+          // Refresh the persisted fields from the freshest snapshot. Live-only
+          // fields (parts, data, toolInvocations, in-memory trace_json) are
+          // preserved by applyStoredFields' `...existing` spread — the server
+          // snapshot must not clobber the just-streamed trace of the last
+          // assistant message.
+          const merged = applyStoredFields(existing, row);
           byId.set(id, merged);
           touched = true;
         }

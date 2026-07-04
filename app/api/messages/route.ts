@@ -88,7 +88,7 @@ export async function GET(request: NextRequest) {
         token_usage_json: string;
         reasoning_json: string;
         parts_json: string;
-        trace_json: string;
+        has_trace: number;
         created_at: number;
         _rowid: number;
       }
@@ -111,7 +111,7 @@ export async function GET(request: NextRequest) {
           token_usage_json: '{}',
           reasoning_json: '',
           parts_json: '[]',
-          trace_json: '[]',
+          has_trace: 0,
           created_at: n.created_at,
           _rowid: 0,
         };

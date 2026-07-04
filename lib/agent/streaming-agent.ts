@@ -23,7 +23,7 @@ import { createOpenAIClient } from './openai-client';
 import { createBuiltinTools } from './builtin-tools';
 import { buildSystemPrompt } from './prompt';
 import { resolveModelWithFallback } from './model-resolver';
-import { convertMessagesToOpenAI, compactConversation, buildMultimodalContent } from './messages';
+import { convertMessagesToOpenAI, compactConversation, buildMultimodalContent, ensureToolInvocations } from './messages';
 import { loadReasoning, clearReasoning } from './reasoning';
 import { buildIncompleteNotice } from './stream';
 import { runAgentLoop } from './loop';
@@ -154,7 +154,12 @@ export async function createStreamingAgent(params: {
     return invocations.every((t) => t.state === 'result');
   });
 
-  const apiMessages = convertMessagesToOpenAI(sanitized, lastReasoning);
+  // From-DB messages (reloaded after switching sessions) carry tool_calls_json
+  // but no live `toolInvocations`; reconstruct them so convertMessagesToOpenAI
+  // doesn't silently drop every tool call + result from the LLM history.
+  const withToolInvocations = ensureToolInvocations(sanitized);
+
+  const apiMessages = convertMessagesToOpenAI(withToolInvocations, lastReasoning);
   if (sessionId && lastReasoning) clearReasoning(sessionId);
 
   // ── Sliding-window context compaction ───────────────────────────────────

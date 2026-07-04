@@ -85,6 +85,12 @@ export const MessageRow = memo(function MessageRow({
     }
   }, [msg.trace_json, showTrace]);
 
+  // From-DB messages carry only a `hasTrace` flag (the multi-MB trace is
+  // fetched on demand by the Trace Drawer); live messages carry the trace
+  // in memory via `trace` above. The button shows for either, gated by the
+  // showTrace setting.
+  const hasTrace = showTrace && !!msg.hasTrace;
+
   const toolInvocations = useMemo(
     () =>
       partsForRender
@@ -125,6 +131,8 @@ export const MessageRow = memo(function MessageRow({
       parts={partsForRender}
       data={msg.data ?? []}
       trace={trace}
+      hasTrace={hasTrace}
+      messageId={msg.id}
       reasoning={msg.reasoning ?? ''}
       isStreaming={isStreaming}
       sessionId={sessionId}

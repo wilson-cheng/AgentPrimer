@@ -190,4 +190,48 @@ describe('database layer', () => {
     expect(listMcpServers()).toHaveLength(1);
     expect(listMcpServers()[0].name).toBe('datetime');
   });
+
+  it('list reads exclude trace_json and report a cheap has_trace flag', async () => {
+    const { createSession, saveMessage, getMessagesPage, getMessageTrace } = await loadDb();
+    createSession('session-1', 'Title');
+    // A user message (no trace) and an assistant message with a multi-step trace.
+    saveMessage({
+      id: 'msg-user',
+      session_id: 'session-1',
+      role: 'user',
+      content: 'hi',
+      attachments_json: '[]',
+      tool_calls_json: '[]',
+      token_usage_json: '{}',
+      reasoning_json: '',
+      parts_json: '[]',
+      trace_json: '[]',
+    });
+    const bigTrace = JSON.stringify([{ step_index: 0, duration_ms: 5, finish_reason: 'stop' }]);
+    saveMessage({
+      id: 'msg-assistant',
+      session_id: 'session-1',
+      role: 'assistant',
+      content: 'done',
+      attachments_json: '[]',
+      tool_calls_json: '[]',
+      token_usage_json: '{}',
+      reasoning_json: '',
+      parts_json: '[]',
+      trace_json: bigTrace,
+    });
+
+    const page = getMessagesPage('session-1', 50);
+    // trace_json must NOT be shipped on the list path (it can be multi-MB).
+    expect(page.messages.every((m) => !('trace_json' in m))).toBe(true);
+    const user = page.messages.find((m) => m.id === 'msg-user')!;
+    const assistant = page.messages.find((m) => m.id === 'msg-assistant')!;
+    expect(user.has_trace).toBe(0);
+    expect(assistant.has_trace).toBe(1);
+
+    // The full trace is fetched on demand per message.
+    expect(getMessageTrace('msg-user')).toBe('[]');
+    expect(getMessageTrace('msg-assistant')).toBe(bigTrace);
+    expect(getMessageTrace('does-not-exist')).toBeNull();
+  });
 });

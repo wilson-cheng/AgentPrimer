@@ -23,7 +23,7 @@
  */
 
 import { Bot, BookPlus, Check, ChevronRight, Copy, Eye, RotateCcw, User } from 'lucide-react';
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   AgentStepTrace,
   Attachment,
@@ -71,8 +71,17 @@ interface MessageBubbleProps {
   expandByDefault?: boolean;
   /** Token usage for this message – shown when showTokenUsage is true */
   tokenUsage?: MessageTokenUsage;
-  /** Per-step trace data from the agent loop – enables the "Show trace" button */
+  /** Per-step trace data from the agent loop – enables the "Show trace" button.
+   *  Populated for LIVE messages (captured from the agent_trace stream event);
+   *  empty for from-DB messages, whose trace is fetched on demand (see
+   *  `hasTrace` + `messageId`). */
   trace?: AgentStepTrace[];
+  /** True when the message has a persisted trace but it isn't loaded yet
+   *  (from-DB messages). Shows the "Trace" button and triggers a lazy fetch
+   *  via /api/messages/trace when the drawer opens. */
+  hasTrace?: boolean;
+  /** Message id — used to fetch the trace on demand when `hasTrace` is set. */
+  messageId?: string;
   /** Max context length of the currently-selected model (for context gauge) */
   contextLength?: number;
   /** Max output length of the currently-selected model (for output gauge) */
@@ -111,16 +120,71 @@ export default function MessageBubble({
   outputLength,
   data = [],
   trace = [],
+  hasTrace = false,
+  messageId,
   incomplete,
   onContinue,
 }: MessageBubbleProps) {
   const [traceOpen, setTraceOpen] = useState(false);
+  const [fetchedTrace, setFetchedTrace] = useState<AgentStepTrace[] | null>(null);
+  const [traceLoading, setTraceLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [subagentOpen, setSubagentOpen] = useState(false);
   const [sendToRagOpen, setSendToRagOpen] = useState(false);
   const isUser = role === 'user';
   const isAssistant = role === 'assistant';
   const subagentMatch = isAssistant ? content.match(/^\[(Sub-agent[^\]]+)\]\n\n([\s\S]*)$/) : null;
+
+  // ── Lazy trace loading ──────────────────────────────────────────────────
+  // Live messages carry their trace in memory (`trace` prop, captured from
+  // the agent_trace stream event). From-DB messages only carry a `hasTrace`
+  // flag — the (potentially multi-MB) trace is fetched here, on demand, when
+  // the user opens the Trace Drawer. See /api/messages/trace.
+  const effectiveTrace: AgentStepTrace[] = trace.length > 0 ? trace : fetchedTrace ?? [];
+  // Tracks the messageId we've already fetched (or are fetching) so the
+  // effect doesn't refetch on unrelated re-renders. A ref (not state) so it
+  // never re-triggers the effect — putting traceLoading/fetchedTrace in the
+  // dependency array would cancel the in-flight fetch on the setTraceLoading
+  // re-render and leave the drawer stuck on "Loading…".
+  const fetchedForRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!traceOpen) return;
+    if (trace.length > 0) return; // already have the live trace
+    if (!hasTrace || !messageId) return; // nothing to load
+    if (fetchedForRef.current === messageId) return; // already fetched/fetching
+    fetchedForRef.current = messageId;
+    let cancelled = false;
+    setTraceLoading(true);
+    fetch(`/api/messages/trace?messageId=${encodeURIComponent(messageId)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (cancelled) return;
+        try {
+          const v = JSON.parse((d as { trace_json?: string })?.trace_json ?? '[]');
+          setFetchedTrace(Array.isArray(v) ? (v as AgentStepTrace[]) : []);
+        } catch {
+          setFetchedTrace([]);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setFetchedTrace([]);
+      })
+      .finally(() => {
+        if (!cancelled) setTraceLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [traceOpen, trace.length, hasTrace, messageId]);
+
+  // Closing the drawer drops the (potentially multi-MB) fetched trace so it
+  // isn't held in memory for the rest of the session; reopening refetches.
+  const closeTrace = useCallback(() => {
+    setTraceOpen(false);
+    setFetchedTrace(null);
+    setTraceLoading(false);
+    fetchedForRef.current = null;
+  }, []);
 
   // Prefer live invocations (streaming) over saved tool calls (historical)
   const liveTools = toolInvocations.length > 0 ? toolInvocations : null;
@@ -477,14 +541,16 @@ export default function MessageBubble({
                 outputLength={outputLength}
               />
             )}
-            {trace.length > 0 && (
+            {(trace.length > 0 || hasTrace) && (
               <button
                 onClick={() => setTraceOpen(true)}
                 className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-sm font-mono bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-500 border border-gray-200 dark:border-gray-700 hover:bg-violet-100 dark:hover:bg-violet-900/30 hover:text-violet-600 dark:hover:text-violet-300 transition-colors"
                 title="View per-step trace"
               >
                 <Eye size={13} />
-                Trace ({trace.length} step{trace.length !== 1 ? 's' : ''})
+                {trace.length > 0
+                  ? `Trace (${trace.length} step${trace.length !== 1 ? 's' : ''})`
+                  : 'Trace'}
               </button>
             )}
           </div>
@@ -513,8 +579,24 @@ export default function MessageBubble({
         )}
       </div>
 
-      {/* Trace drawer */}
-      {traceOpen && <TraceDrawer trace={trace} onClose={() => setTraceOpen(false)} />}
+      {/* Trace drawer — live trace is shown immediately; from-DB trace is
+          fetched on demand (see the lazy-load effect above). */}
+      {traceOpen &&
+        (traceLoading && effectiveTrace.length === 0 ? (
+          <div
+            className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4"
+            onClick={closeTrace}
+          >
+            <div
+              className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl px-8 py-6 text-sm text-gray-500 dark:text-gray-400"
+              onClick={(e) => e.stopPropagation()}
+            >
+              Loading trace…
+            </div>
+          </div>
+        ) : (
+          <TraceDrawer trace={effectiveTrace} onClose={closeTrace} />
+        ))}
 
       {/* Send-to-RAG dialog (3-step: summarize → send → index) */}
       {sendToRagOpen && (
