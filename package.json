@@ -73,16 +73,16 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "20.19.43",
+    "@types/node": "26.1.0",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/react-syntax-highlighter": "^15.5.13",
-    "@types/uuid": "^10.0.0",
-    "eslint": "^9",
-    "eslint-config-next": "16.2.6",
-    "prettier": "^3.3.3",
+    "@types/uuid": "^11.0.0",
+    "eslint": "^10",
+    "eslint-config-next": "16.2.10",
+    "prettier": "^3.9.4",
     "tailwindcss": "^4",
-    "typescript": "5.9.3",
+    "typescript": "6.0.3",
     "vitest": "^4.1.8"
   },
   "overrides": {
