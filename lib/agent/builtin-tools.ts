@@ -42,7 +42,7 @@ import { isBuiltinToolEnabled, listBuiltinToolsWithState } from '../builtin-tool
 import { copyFileToAgentFiles } from '../agent-files';
 import type { AgentFileResult } from '../agent-files';
 import { retrieveChunks } from '../rag';
-import { getOutputLength } from '../model-lengths';
+import { getEffectiveOutputLength } from './model-overrides';
 import { startSubagentMonitor } from '../subagent-monitor';
 import {
   resolveAgentPath,
@@ -120,7 +120,7 @@ async function runSubagentWithTaskFile(
     const response = await openai.chat.completions.create({
       model: modelId,
       messages: msgs,
-      max_tokens: getOutputLength(modelId),
+      max_tokens: getEffectiveOutputLength(modelId),
       ...(openaiTools.length ? { tools: openaiTools, tool_choice: 'auto' } : {}),
     });
     const choice = response.choices[0];

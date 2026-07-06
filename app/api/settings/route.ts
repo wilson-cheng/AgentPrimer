@@ -1,4 +1,5 @@
 import { getAllSettings, setSetting } from '@/lib/db';
+import { clearModelOverrideCache } from '@/lib/agent/model-overrides';
 import { NextRequest, NextResponse } from 'next/server';
 
 export const runtime = 'nodejs';
@@ -52,12 +53,20 @@ export async function PUT(request: NextRequest) {
     'subagent_poll_max_attempts',
     'subagent_progress_bubbles_enabled',
     'subagent_auto_followup_enabled',
+    'model_context_overrides',
+    'model_output_overrides',
   ];
 
   for (const key of allowed) {
     if (typeof body[key] === 'string') {
       setSetting(key, body[key]);
     }
+  }
+
+  // Invalidate the in-memory model-override cache so the next agent turn
+  // picks up the freshly saved context/output overrides without a restart.
+  if (typeof body.model_context_overrides === 'string' || typeof body.model_output_overrides === 'string') {
+    clearModelOverrideCache();
   }
 
   return NextResponse.json({ ok: true });

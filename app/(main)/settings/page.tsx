@@ -36,7 +36,14 @@ import {
   AlertTriangle,
   RotateCcw,
   BookOpen,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react';
+
+import {
+  lookupContextLength,
+  lookupOutputLength,
+} from '@/lib/model-lengths';
 
 export default function SettingsPage() {
   // LLM API endpoint URL (e.g., https://api.deepseek.com/v1)
@@ -69,6 +76,25 @@ export default function SettingsPage() {
   const [fetchingModels, setFetchingModels] = useState(false);
   // Error message if the model list fetch fails
   const [modelFetchError, setModelFetchError] = useState('');
+
+  // ── Advanced model parameters (collapsible) ────────────────────────────
+  // Whether the "Advanced" panel under the model dropdown is expanded
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  // Per-model detail maps fetched from the provider's /v1/models endpoint
+  // (context_length + max_output_tokens). Keyed by model ID.
+  const [modelDetails, setModelDetails] = useState<
+    Record<string, { context_length?: number; max_output_tokens?: number }>
+  >({});
+  // User-editable context-window override for the currently selected model.
+  // Empty string = use the application default (provider / lookup table).
+  const [advancedContextWindow, setAdvancedContextWindow] = useState<number | ''>('');
+  // User-editable max-output-size override for the currently selected model.
+  const [advancedMaxOutput, setAdvancedMaxOutput] = useState<number | ''>('');
+  // The full override maps persisted to the settings table. These are loaded
+  // once on mount and updated as the user edits individual model values so
+  // switching models preserves per-model overrides without losing them.
+  const [contextOverrides, setContextOverrides] = useState<Record<string, number>>({});
+  const [outputOverrides, setOutputOverrides] = useState<Record<string, number>>({});
 
   // API key test state
   // Whether a connectivity test is in progress
@@ -178,6 +204,11 @@ export default function SettingsPage() {
       const data = await res.json();
       if (data.models?.length) {
         setAvailableModels(data.models);
+        // Persist the per-model detail map (context_length + max_output_tokens)
+        // so the Advanced panel can show defaults when a model is selected.
+        if (data.details && typeof data.details === 'object') {
+          setModelDetails(data.details as typeof modelDetails);
+        }
       } else {
         setModelFetchError(data.error || 'No models returned');
         setAvailableModels([]);
@@ -236,6 +267,16 @@ export default function SettingsPage() {
         const lfMasked = lfSecret.includes('\u2022');
         setLangfuseSecretKey(lfMasked ? '' : lfSecret);
         setLangfuseSecretMasked(lfMasked);
+        // Load persisted per-model override maps (JSON strings in the settings
+        // table). Empty/corrupt blobs safely fall back to empty objects.
+        try {
+          const ctxRaw = data.settings?.model_context_overrides;
+          if (ctxRaw) setContextOverrides(JSON.parse(ctxRaw));
+        } catch { /* corrupt JSON — ignore */ }
+        try {
+          const outRaw = data.settings?.model_output_overrides;
+          if (outRaw) setOutputOverrides(JSON.parse(outRaw));
+        } catch { /* corrupt JSON — ignore */ }
         setLoading(false);
         // Auto-fetch model list on load only when the key is a real value
         if (ep && !masked && key) fetchModels(ep, key);
@@ -270,6 +311,45 @@ export default function SettingsPage() {
       })
       .catch(() => {});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Sync Advanced fields when the selected model changes ───────────────
+  // Whenever the user picks a different model (or types a new ID), recompute
+  // the default Context Window / Max Output values shown in the Advanced
+  // panel. The priority is:
+  //   1. A user-saved override for this exact model ID (from the override maps)
+  //   2. The provider-fetched value from /v1/models (modelDetails)
+  //   3. The built-in lookup table (lookupContextLength / lookupOutputLength)
+  //   4. Empty string (no default known)
+  // The user can then adjust the number manually; their edit is staged into
+  // the override maps and persisted on Save.
+  useEffect(() => {
+    if (!defaultModel) {
+      setAdvancedContextWindow('');
+      setAdvancedMaxOutput('');
+      return;
+    }
+    const detail = modelDetails[defaultModel];
+    // Context window
+    const savedCtx = contextOverrides[defaultModel];
+    if (savedCtx !== undefined) {
+      setAdvancedContextWindow(savedCtx);
+    } else if (detail?.context_length) {
+      setAdvancedContextWindow(detail.context_length);
+    } else {
+      const looked = lookupContextLength(defaultModel);
+      setAdvancedContextWindow(looked ?? '');
+    }
+    // Max output size
+    const savedOut = outputOverrides[defaultModel];
+    if (savedOut !== undefined) {
+      setAdvancedMaxOutput(savedOut);
+    } else if (detail?.max_output_tokens) {
+      setAdvancedMaxOutput(detail.max_output_tokens);
+    } else {
+      const looked = lookupOutputLength(defaultModel);
+      setAdvancedMaxOutput(looked ?? '');
+    }
+  }, [defaultModel, modelDetails, contextOverrides, outputOverrides]);
 
   // Probe the embedding endpoint for available models. Falls back to the
   // chat endpoint/key when the embedding fields are blank.
@@ -367,6 +447,24 @@ export default function SettingsPage() {
 
   const handleSave = async () => {
     setSaving(true);
+    // Stage the current Advanced field values into the override maps for the
+    // selected model so they are persisted alongside every other setting.
+    // A model must be selected for the override to be meaningful; empty
+    // values are skipped (the default will be used instead).
+    const nextContextOverrides = { ...contextOverrides };
+    const nextOutputOverrides = { ...outputOverrides };
+    if (defaultModel) {
+      if (advancedContextWindow !== '' && advancedContextWindow > 0) {
+        nextContextOverrides[defaultModel] = advancedContextWindow;
+      } else {
+        delete nextContextOverrides[defaultModel];
+      }
+      if (advancedMaxOutput !== '' && advancedMaxOutput > 0) {
+        nextOutputOverrides[defaultModel] = advancedMaxOutput;
+      } else {
+        delete nextOutputOverrides[defaultModel];
+      }
+    }
     // Only send api_key when the user has typed a new value — skip it when the
     // field is empty so the existing key in the DB is preserved unchanged.
     const saveBody: Record<string, string> = {
@@ -390,7 +488,13 @@ export default function SettingsPage() {
       langfuse_enabled: String(langfuseEnabled),
       langfuse_public_key: langfusePublicKey,
       langfuse_base_url: langfuseBaseUrl,
+      model_context_overrides: JSON.stringify(nextContextOverrides),
+      model_output_overrides: JSON.stringify(nextOutputOverrides),
     };
+    // Keep the in-memory override maps in sync so a subsequent model switch
+    // (without a reload) shows the just-saved values.
+    setContextOverrides(nextContextOverrides);
+    setOutputOverrides(nextOutputOverrides);
     if (apiKey) saveBody.api_key = apiKey;
     if (embeddingApiKey) saveBody.embedding_api_key = embeddingApiKey;
     if (langfuseSecretKey) saveBody.langfuse_secret_key = langfuseSecretKey;
@@ -817,6 +921,84 @@ export default function SettingsPage() {
                         Used when no model is selected in chat. Enter Base URL above and press Tab
                         to auto-load available models.
                       </p>
+                    )}
+                  </div>
+
+                  {/* Advanced model parameters — collapsible */}
+                  <div className="rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => setAdvancedOpen((v) => !v)}
+                      className="w-full flex items-center justify-between px-4 py-2.5 bg-gray-50 dark:bg-gray-700/50 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+                    >
+                      <span className="flex items-center gap-2 text-sm font-600 text-gray-700 dark:text-gray-300">
+                        <Sliders size={14} className="text-gray-500 dark:text-gray-400" />
+                        Advanced
+                      </span>
+                      {advancedOpen ? (
+                        <ChevronDown size={16} className="text-gray-400" />
+                      ) : (
+                        <ChevronRight size={16} className="text-gray-400" />
+                      )}
+                    </button>
+
+                    {advancedOpen && (
+                      <div className="px-4 py-4 space-y-4">
+                        <p className="text-sm text-gray-400 dark:text-gray-500">
+                          Override the default model parameters used when calling the API. Values
+                          are pre-filled from the provider or the built-in lookup table when you
+                          select a model; adjust them as needed. Leave blank to use the default.
+                        </p>
+
+                        {/* Context Window */}
+                        <div className="space-y-1.5">
+                          <label className="text-sm font-600 text-gray-700 dark:text-gray-300 flex items-center gap-1.5">
+                            <Cpu size={14} className="text-indigo-500" />
+                            Context Window (tokens)
+                          </label>
+                          <input
+                            type="number"
+                            min={0}
+                            value={advancedContextWindow}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              setAdvancedContextWindow(v === '' ? '' : Math.max(0, parseInt(v, 10) || 0));
+                            }}
+                            placeholder="Default from model"
+                            disabled={!defaultModel}
+                            className="w-full h-11 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 px-3 rounded-lg border-2 border-gray-200 dark:border-gray-600 text-sm focus:outline-none focus:border-blue-500 transition-all duration-200 font-mono disabled:opacity-50 disabled:cursor-not-allowed"
+                          />
+                          <p className="text-sm text-gray-400 dark:text-gray-500">
+                            Maximum total tokens (prompt + completion) the model can accept.
+                            {!defaultModel && ' Select a model first.'}
+                          </p>
+                        </div>
+
+                        {/* Max Output Size */}
+                        <div className="space-y-1.5">
+                          <label className="text-sm font-600 text-gray-700 dark:text-gray-300 flex items-center gap-1.5">
+                            <Sliders size={14} className="text-purple-500" />
+                            Max Output Size (tokens)
+                          </label>
+                          <input
+                            type="number"
+                            min={0}
+                            value={advancedMaxOutput}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              setAdvancedMaxOutput(v === '' ? '' : Math.max(0, parseInt(v, 10) || 0));
+                            }}
+                            placeholder="Default from model"
+                            disabled={!defaultModel}
+                            className="w-full h-11 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 px-3 rounded-lg border-2 border-gray-200 dark:border-gray-600 text-sm focus:outline-none focus:border-blue-500 transition-all duration-200 font-mono disabled:opacity-50 disabled:cursor-not-allowed"
+                          />
+                          <p className="text-sm text-gray-400 dark:text-gray-500">
+                            Maximum number of tokens the model can generate in a single response
+                            (sent as <code className="text-xs">max_tokens</code> in the API call).
+                            {!defaultModel && ' Select a model first.'}
+                          </p>
+                        </div>
+                      </div>
                     )}
                   </div>
                 </div>

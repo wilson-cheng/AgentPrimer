@@ -23,7 +23,7 @@ import { formatDataStreamPart } from 'ai';
 import type { JSONValue } from 'ai';
 import type { OutputSchema } from '../memory';
 import { upsertAssistantMessage, getSetting } from '../db';
-import { getOutputLength } from '../model-lengths';
+import { getEffectiveOutputLength } from './model-overrides';
 import { createAgentTrace, endGeneration, finalizeTrace, startGeneration } from '../langfuse';
 import { toolsToOpenAIFormat } from './schema';
 import {
@@ -254,7 +254,7 @@ export async function runAgentLoop(params: {
       stream = await openai.chat.completions.create({
         model: modelId,
         messages: msgs,
-        max_tokens: getOutputLength(modelId),
+        max_tokens: getEffectiveOutputLength(modelId),
         ...(openaiTools ? { tools: openaiTools, tool_choice: 'auto' } : {}),
         stream: true,
         stream_options: { include_usage: true },
@@ -278,7 +278,7 @@ export async function runAgentLoop(params: {
           stream = await openai.chat.completions.create({
             model: modelId,
             messages: msgs,
-            max_tokens: getOutputLength(modelId),
+            max_tokens: getEffectiveOutputLength(modelId),
             ...(openaiTools ? { tools: openaiTools, tool_choice: 'auto' } : {}),
             stream: true,
             stream_options: { include_usage: true },

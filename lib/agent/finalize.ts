@@ -11,7 +11,7 @@
 import OpenAI from 'openai';
 import { formatDataStreamPart } from 'ai';
 import type { OutputSchema } from '../memory';
-import { getOutputLength } from '../model-lengths';
+import { getEffectiveOutputLength } from './model-overrides';
 import { normalizeTokenUsage } from './usage';
 import { toJSONValue } from './sanitize';
 import type { AgentStreamWriter, TokenUsage } from './types';
@@ -89,7 +89,7 @@ export function buildFinalizeRequest(args: {
   return {
     model: modelId,
     messages: transcript,
-    max_tokens: getOutputLength(modelId),
+    max_tokens: getEffectiveOutputLength(modelId),
     response_format: { type: 'json_object' },
     stream: false,
   };
