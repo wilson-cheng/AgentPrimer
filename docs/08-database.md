@@ -184,6 +184,9 @@ Key/value configuration store. Read by the agent (settings come into `lib/agent/
 | `tracing_enabled` | _not seeded_ | `'1'` enables per-step trace capture. |
 | `reasoning:<sessionId>` | — | Last `reasoning_content` for a session (thinking models) |
 | `builtin_tool_enabled:<id>` | — | `'1'` or `'0'` per tool (e.g. `builtin_tool_enabled:run_shell`) |
+| `model_details` | _not seeded_ | JSON map of `{ modelId: { context_length, max_output_tokens } }` fetched from the provider's `/v1/models` endpoint and cached so the Settings → Advanced panel can show defaults. |
+| `model_context_overrides` | _not seeded_ | JSON map of `{ modelId: number }` — user-editable context-window override that wins over both the provider-fetched value and the built-in lookup table. Read & cached by `lib/agent/model-overrides.ts`. |
+| `model_output_overrides` | _not seeded_ | JSON map of `{ modelId: number }` — user-editable max-output-tokens override (same priority chain as context). |
 
 Any additional keys can be stored and retrieved with `getSetting(key)` / `setSetting(key, value)`.
 
@@ -587,12 +590,15 @@ getFirstUserMessage(sessionId): string | null
 
 ```typescript
 saveMessage(msg: Omit<Message, 'created_at'>): void
-upsertAssistantMessage(msg): void   // checkpoint write — used during streaming
-getMessages(sessionId): Message[]
-getMessagesPage(sessionId, opts): Message[]   // cursor-paginated reads
-getMessagesAfter(sessionId, afterRowid): Message[]   // tail polling for sub-agent UI
+upsertAssistantMessage(msg): void   // checkpoint write — used during streaming AND per-step in the detached loop
+getMessages(sessionId): Message[]                    // legacy: all messages (avoid for long sessions)
+getMessagesPage(sessionId, opts): Message[]          // cursor-paginated reads (limit + before cursor)
+getMessagesAfter(sessionId, afterRowid, limit?): Message[]  // tail polling / post-stream catch-up
+getMessageTrace(messageId): string | null            // on-demand trace_json for a single message (lazy load)
 countMessages(sessionId): number
 ```
+
+> **Why `getMessageTrace` is separate:** The paginated readers (`getMessagesPage` / `getMessagesAfter`) deliberately **omit** `trace_json` — a single multi-step assistant message can persist a multi-MB trace. Shipping it on every session-load / poll was the root cause of the large-session slowdown. The list readers ship only a `has_trace` flag; the Trace Drawer fetches the full trace on demand via `GET /api/messages/trace?messageId=<uuid>`.
 
 ### Skills, Function Tools & MCP Servers
 
@@ -674,13 +680,11 @@ If the app is fully stopped, you may copy `data/db/agent.db` together with any `
 
 1. **Full-text search on messages** — Add a virtual FTS5 table (`CREATE VIRTUAL TABLE messages_fts USING fts5(content, content='messages', content_rowid='rowid')`) to enable fast keyword search across all chat history.
 
-2. **Message pagination** — Currently `getMessages(sessionId)` returns all messages. For long sessions, implement cursor-based pagination to avoid loading thousands of messages.
+2. **Token usage analytics** — The `token_usage_log` table stores per-turn input, cached, and output token counts. The Statistics page (`/statistics`) aggregates these into Recharts bar charts, selectable by time window (7/30/90/365 days).
 
-3. **Token usage analytics** — The `token_usage_log` table stores per-turn input, cached, and output token counts. The Statistics page (`/statistics`) aggregates these into Recharts bar charts, selectable by time window (7/30/90/365 days).
+3. **Session export** — Add a `GET /api/sessions/<id>/export` route that dumps a session to JSON or Markdown for portability.
 
-4. **Session export** — Add a `GET /api/sessions/<id>/export` route that dumps a session to JSON or Markdown for portability.
-
-5. **Multi-user with row-level auth** — Add a `user_id` foreign key to `sessions` and `agent_tasks`. Filter all queries by the authenticated user ID from `proxy.ts`.
+4. **Multi-user with row-level auth** — Add a `user_id` foreign key to `sessions` and `agent_tasks`. Filter all queries by the authenticated user ID from `proxy.ts`.
 
 ---
 

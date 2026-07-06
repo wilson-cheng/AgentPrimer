@@ -13,7 +13,9 @@ After reading this module you will be able to:
 - Explain the difference between synchronous and asynchronous sub-agents
 - Identify the safety limits (maxSteps, timeouts) and why they exist
 
-> **File map:** `lib/agent.ts` is a 28-line barrel that re-exports everything from `lib/agent/index.ts`. The actual implementation lives in fourteen smaller files under `lib/agent/`. This module names the specific file each piece of logic lives in.
+> **File map:** `lib/agent.ts` is a 28-line barrel that re-exports everything from `lib/agent/index.ts`. The actual implementation lives in fifteen smaller files under `lib/agent/`. This module names the specific file each piece of logic lives in.
+
+> **Detached execution:** As of the latest update the loop no longer runs *inside* the HTTP response's `execute` callback. `lib/agent/run-manager.ts` starts the loop as a floating background promise that survives a browser close, writes AI-SDK data-stream parts to a bounded replay buffer, and the HTTP response is a thin tail that replays the buffer then forwards new parts live. The Stop button (`POST /api/chat/stop`) fires the run's `AbortController` — the only thing that cancels a run. See [Module 04 — Streaming → Detached Run Manager](./04-streaming.md#detached-run-manager) for the full mechanism.
 
 ---
 
@@ -63,11 +65,16 @@ flowchart TD
     Q --> R[Browser shows approval UI]
     P -->|approved or not required| S[Run tool, get result]
     S --> T[Emit tool result to browser]
-    T --> U[Append assistant msg + tool results to history]
+    T --> T2[Checkpoint partial progress to DB]
+    T2 --> U[Append assistant msg + tool results to history]
     U --> V{maxSteps reached?}
     V -->|no| H
     V -->|yes| W[Emit finish_message: max steps]
     W --> L
+
+    X[User clicks Stop] -.->|abort signal| Y[Cancel in-flight LLM call]
+    Y --> Z[Emit incomplete-marker + finish_step]
+    Z --> L
 ```
 
 ---
@@ -280,11 +287,40 @@ The conversion function `convertMessagesToOpenAI()` in `lib/agent/messages.ts` h
 | Limit | Value | What happens when reached |
 |-------|-------|--------------------------|
 | `maxSteps` | 100 by default (`max_agent_steps` setting; falls back to 100 in `streaming-agent.ts` if unset) | Loop exits; emits `finish_message` with reason `"max-steps"` |
+| Wall-clock watchdog | 30 minutes (`MAX_RUN_MS` in `run-manager.ts`) | Force-aborts the run's `AbortController` so a hung tool/subprocess can't brick the session with 409s until restart |
 | Function tool timeout | 35 s parent kill (`lib/function-tools-loader.ts`), 30 s inner deadline (`lib/function-tool-worker.js` — the effective ceiling) | Subprocess is killed; tool returns `{ error: "timeout" }` |
 | Function tool memory | 256 MB (`--max-old-space-size`) | Node.js OOM-kills the subprocess |
 | MCP call timeout | 30 seconds | Client throws; tool returns `{ error: "timeout" }` |
+| Replay buffer cap | 2000 parts (`REPLAY_CAP` in `run-manager.ts`) | Drop-oldest so a readerless run can't hold its entire token stream in memory; live tail readers receive parts directly via subscribers |
+| One active run per session | `RUN_IN_PROGRESS` (HTTP 409) | A second send while a run is live is rejected server-side; the frontend disables Send while active |
 
 These limits prevent runaway agents from consuming unbounded resources or getting stuck in infinite loops.
+
+---
+
+## Detached Execution, Checkpointing & Abort
+
+Three mechanisms work together so that a long multi-tool run survives a browser close, a refresh, or an explicit Stop:
+
+### 1. Detached Run Manager (`lib/agent/run-manager.ts`)
+
+`createStreamingAgent` (default `detached: true`) calls `startRun()`, which:
+
+- Registers an `ActiveRun` in a module-scoped `Map` keyed by `${owner}:${sessionId}` (so one user can't abort or inspect another's run).
+- Creates an `AbortController` per run.
+- Starts a 30-minute `setTimeout` watchdog that force-aborts a hung run.
+- Launches the loop as a **floating promise** (`void (async () => …)()`) — *not* awaited, *not* tied to any HTTP request.
+- Returns immediately; `createTailResponse(run)` builds an AI-SDK `createDataStreamResponse` that **replays the bounded buffer** then **subscribes** for live parts until the run finishes.
+
+If the browser disconnects, the AI SDK cancels the tail stream, the subscriber's `writer.write()` throws, and the subscriber detaches — **but the run itself keeps going**. A later reopen polls `/api/chat/active`; if the run is still live it re-attaches a tail; if the run already finished, the persisted result is loaded from the DB via `/api/messages`.
+
+### 2. Per-Step Checkpointing (`lib/agent/loop.ts`)
+
+After every completed step the loop calls `checkpoint()`, which writes a partial assistant message row to SQLite (`upsertAssistantMessage`) containing the accumulated text, reasoning, tool calls, parts, and trace. A 1.5-second debounce (`CHECKPOINT_MIN_INTERVAL_MS`) and a signature check prevent redundant writes. A final `onFinish` write overwrites the checkpoint row with the complete result. This means a refresh during a long multi-tool run does not lose the work already done.
+
+### 3. Abort / Stop (`POST /api/chat/stop`)
+
+The Stop button calls `abortRun(owner, sessionId)`, which fires the run's `AbortController`. The loop passes `signal` to every `openai.chat.completions.create({ signal })` call, so the in-flight LLM request is cancelled immediately. The loop also checks `abortSignal?.aborted` at the top of every step, so a cancel that lands between steps exits cleanly without firing another LLM request. On abort the loop emits an `incomplete-marker` part (reason `aborted`) + a `data` event + `finish_step`, then breaks. The finalize call is skipped on explicit abort (its `openai.create({ signal })` would throw `AbortError`).
 
 ---
 

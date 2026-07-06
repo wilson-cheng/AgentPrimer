@@ -120,19 +120,22 @@ After those, read the remaining modules (04, 06, 07, 08, 09, 12, 13) in any orde
 ```
 Browser (React/Next.js)
     │
-    │  POST /api/chat  →  AI SDK data stream
+    │  POST /api/chat  →  AI SDK data stream (tail of a detached run)
     ▼
 proxy.ts  (JWT page auth; API routes enforce auth individually where needed)
     │
     ▼
-app/api/chat/route.ts  (save message, start agent)
+app/api/chat/route.ts  (save message, start detached agent run)
+    │
+    ▼
+lib/agent/run-manager.ts  (floating promise + replay buffer + AbortController + 30-min watchdog)
     │
     ▼
 lib/agent/*.ts  ─────────────────────────────────┐
   (lib/agent.ts is a barrel; real code in        │
    streaming-agent.ts + loop.ts + helpers)       │
-    │  openai.chat.completions.create()        │
-    │  ↕ streaming tool calls                  │
+    │  openai.chat.completions.create({ signal })  │
+    │  ↕ streaming tool calls                      │
     ▼                                          │
 Built-in tools       Function-tool subprocess    MCP server        SKILL.md instructions
 (read/write/shell)   (function.json + index.js)  (any language)    (loaded into prompt)
@@ -140,13 +143,13 @@ Built-in tools       Function-tool subprocess    MCP server        SKILL.md inst
     └───────────────────────┴──────────────────┘
     │  tool results fed back into loop
     ▼
-createDataStreamResponse()  →  browser receives tokens live
-    │
+createTailResponse()  →  browser receives tokens live (browser close only tears down the tail)
+    │  · per-step checkpoint to SQLite
     ▼
 SQLite (sessions · messages · tasks · approvals)
 ```
 
-The key insight: the agent loop is **hand-written**, not hidden inside a framework. Every iteration of `openai.chat.completions.create()` is visible. This is intentional — the goal is understanding, not abstraction.
+The key insight: the agent loop is **hand-written**, not hidden inside a framework. Every iteration of `openai.chat.completions.create()` is visible. This is intentional — the goal is understanding, not abstraction. The loop runs **detached** from the HTTP response via `lib/agent/run-manager.ts`, so closing the browser mid-stream no longer kills the run — it keeps going, checkpoints partial progress to SQLite after every step, and a later reopen re-attaches a tail or loads the persisted result. Only the **Stop** button (`POST /api/chat/stop`) cancels a run.
 
 ---
 
@@ -156,6 +159,7 @@ The key insight: the agent loop is **hand-written**, not hidden inside a framewo
 |----------|------|---------------------|
 | **`openai` npm directly** | Not the Vercel AI SDK adapter | Shows every raw API field; preserves `reasoning_content` for DeepSeek R1 chain-of-thought |
 | **Hand-written agent loop** | Not `streamText(maxSteps:10)` | You see exactly what happens on each iteration |
+| **Detached run manager** | Loop runs as a floating promise, not inside the HTTP `execute` callback | Browser close no longer kills the run; per-step SQLite checkpoints survive refreshes; Stop button is the only cancel path |
 | **SQLite + better-sqlite3** | Single file database | Zero external services; synchronous API is easy to reason about |
 | **Function tools in subprocesses** | `child_process.spawn()` worker | Buggy or untrusted callable tool code cannot crash the Next.js server; SKILL.md skills are instruction text, not executable code |
 | **`proxy.ts` not `middleware.ts`** | Next.js 16 convention | A real gotcha most tutorials miss — documented so you don't hit it |

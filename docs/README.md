@@ -64,12 +64,12 @@ Multi-Agent Orchestration
 |---|--------|---------------------|
 | [00](./00-build-from-scratch.md) | **Build from Scratch** | Go from `create-next-app` to a working ReAct agent in ~60 lines of code; understand the primitives AgentPrimer builds on |
 | [01](./01-architecture.md) | **Architecture** | System architecture, request flow, file layout, technology choices, and deployment trade-offs |
-| [02](./02-agent-loop.md) | **The Agent Loop** | The ReAct (Reason + Act) algorithm that powers all agents; how tool calls are detected, executed, and fed back; async sub-agents |
+| [02](./02-agent-loop.md) | **The Agent Loop** | The ReAct (Reason + Act) algorithm that powers all agents; how tool calls are detected, executed, and fed back; detached RunManager, per-step checkpointing, Stop/abort; async sub-agents |
 | [03](./03-tools-and-skills.md) | **Tools, Function Tools, Skills & MCP** | Built-in tools, subprocess-isolated function tools, SKILL.md instruction modules, MCP servers; how to write and install your own |
-| [04](./04-streaming.md) | **Streaming Protocol** | AI SDK data stream wire format, every event type, how the browser consumes the stream with `useChat`, reasoning tokens |
+| [04](./04-streaming.md) | **Streaming Protocol** | AI SDK data stream wire format, every event type, how the browser consumes the stream with `useChat`, reasoning tokens, detached RunManager (browser-close-safe runs), heartbeat wrapper |
 | [05](./05-memory.md) | **Memory & Agents** | `data/system.md`, `data/agents/<agent>/agent.md`, `data/agents/<agent>/memory.md`, structured output schemas, multi-agent patterns, async sub-agents |
 | [06](./06-approval-gate.md) | **Approval Gate** | Human-in-the-loop design; approval scopes; how the gate pauses the agent and resumes cleanly |
-| [07](./07-frontend.md) | **Frontend Architecture** | React component tree, `useChat` data flow, streaming UI updates, Preview Panel, file sending |
+| [07](./07-frontend.md) | **Frontend Architecture** | React component tree, `useChat` data flow, streaming UI updates, cursor pagination, lazy trace loading, `pickMessageParts`, Preview Panel, file sending |
 | [08](./08-database.md) | **Database Design** | SQLite schema, ER diagram, all tables (including RAG index, token usage log, async task tracking), WAL mode, migration strategy |
 | [09](./09-ecosystem-comparison.md) | **Ecosystem Comparison** | Three-way comparison: AgentPrimer vs OpenClaw vs Hermes Agent — architecture, feature matrix, gap analysis, and roadmap |
 | [10](./10-structured-output.md) | **Structured Output** | `response_format: json_object`, schema-in-prompt approach, the `extractor` agent, dual rendering path (live vs. historical), `StructuredOutputPanel` |

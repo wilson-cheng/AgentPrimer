@@ -28,14 +28,20 @@ AgentPrimer is a **full-stack AI agent platform** built on Next.js 16 (App Route
 ### Core File Layout
 
 ```
-app/api/chat/route.ts     — POST /api/chat streaming entry point
+app/api/chat/route.ts     — POST /api/chat streaming entry point (detached run)
+app/api/chat/active/route.ts — GET /api/chat/active (is a background run live?)
+app/api/chat/stop/route.ts — POST /api/chat/stop (Stop button — aborts the run)
+app/api/messages/trace/route.ts — GET on-demand trace_json for a single message
+app/api/preview/[...slug]/route.ts — Unauthenticated sandboxed preview server (data/preview/ only)
 lib/agent.ts              — Barrel export for lib/agent/*
 lib/agent/streaming-agent.ts — ★ createStreamingAgent entry point
-lib/agent/loop.ts         — ★ Core agent loop (ReAct, streaming, tool dispatch, structured output)
+lib/agent/loop.ts         — ★ Core agent loop (ReAct, streaming, tool dispatch, structured output, per-step checkpointing)
+lib/agent/run-manager.ts  — ★ Detached RunManager (floating promise, replay buffer, AbortController, 30-min watchdog)
+lib/agent/model-overrides.ts — User-editable context/output length overrides (DB-backed, cached)
 lib/db.ts                 — SQLite layer (better-sqlite3, WAL mode, auto-migration)
 lib/memory.ts             — agents/<agent>/memory.md / agents/<agent>/agent.md / system.md helpers
 lib/auth.ts               — JWT auth (jose), bcrypt password hashing
-lib/builtin-tools-registry.ts — 21 built-in tool metadata catalogue
+lib/builtin-tools-registry.ts — 22 built-in tool metadata catalogue
 lib/skills-loader.ts      — SKILL.md skill loader (injects instructions into system prompt)
 lib/function-tools-loader.ts  — Function tool loader (callable code in subprocesses)
 lib/function-tool-worker.js   — Subprocess entry point for function tool execution
@@ -114,3 +120,6 @@ Five agents ship by default: `main`, `researcher`, `coder`, `extractor`, and `ex
 3. **Streaming headers**: Add `X-Accel-Buffering: no` and `Cache-Control: no-cache, no-transform` to SSE responses when behind nginx
 4. **`serverExternalPackages`** in [next.config.ts](next.config.ts): `better-sqlite3`, `@modelcontextprotocol/sdk`, `simple-git` must be external (not bundled)
 5. **`zod-to-json-schema` adds `$schema`**: Must delete `$schema` from the output before sending to OpenAI (see `zodToOpenAISchema` in [lib/agent/schema.ts](lib/agent/schema.ts))
+6. **Detached run**: The agent loop runs as a floating promise via `lib/agent/run-manager.ts`, NOT inside the HTTP `execute` callback. Closing the browser only tears down the tail — the loop keeps running and checkpoints to SQLite. Only `POST /api/chat/stop` cancels a run (via `AbortController`). One active run per (owner, session) → 409 `RUN_IN_PROGRESS`.
+7. **Model length overrides**: `lib/model-lengths.ts` is client-safe (no DB). The DB-backed override logic lives in `lib/agent/model-overrides.ts` (server-only) and caches `model_context_overrides` / `model_output_overrides` settings; call `clearModelOverrideCache()` after saving.
+8. **Preview route is unauthenticated**: `/api/preview/[...slug]` intentionally has no JWT check so sandboxed iframes (opaque origin) can load subresources. The security boundary is directory scope (`data/preview/` only) via `resolvePreviewPath` + symlink realpath check.

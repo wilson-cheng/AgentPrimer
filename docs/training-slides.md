@@ -555,22 +555,25 @@ Browser (useChat hook)
 proxy.ts  ← JWT auth check
            (Next.js 16: proxy.ts, NOT middleware.ts)
     ▼
-/api/chat/route.ts  ← save user message to SQLite
+/api/chat/route.ts  ← save user message to SQLite; reject if RUN_IN_PROGRESS (409)
     ▼
-lib/agent/streaming-agent.ts  ← createStreamingAgent()
+lib/agent/streaming-agent.ts  ← createStreamingAgent(detached: true)
     ├─ load agents/<agent>/agent.md config
     ├─ load data/agents/<agent>/memory.md
     ├─ load skill tools (subprocess)
     ├─ load MCP tools (child process / HTTP)
     └─ load builtin-tools-registry.ts
     ▼
-openai.chat.completions.create({ stream: true })
+lib/agent/run-manager.ts  ← startRun(): floating promise + AbortController + watchdog
     ▼
-createDataStreamResponse() ← SSE wire format
+openai.chat.completions.create({ stream: true, signal })
+    │  (per-step checkpoint to SQLite; Stop button fires AbortController)
+    ▼
+createTailResponse() ← replay buffer + live forward (browser close only tears down tail)
     ▼
 Browser ← real-time streaming text
     ▼
-onFinish() ← save assistant message to SQLite
+onFinish() ← save final assistant message to SQLite
 ```
 
 ---

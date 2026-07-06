@@ -39,7 +39,7 @@ graph TB
     Browser["Browser\n(React / Next.js)"]
     Proxy["proxy.ts\n(JWT auth middleware)"]
     Chat["app/api/chat/route.ts\n(POST /api/chat)"]
-    Agent["lib/agent/streaming-agent.ts\n(createStreamingAgent)\n+ lib/agent/loop.ts (runAgentLoop)"]
+    Agent["lib/agent/streaming-agent.ts\n(createStreamingAgent)\n+ lib/agent/loop.ts (runAgentLoop)\n+ lib/agent/run-manager.ts (detached RunManager)"]
     LLM["OpenAI-compatible API\n(DeepSeek, OpenAI, Ollama…)"]
     DB["data/db/agent.db\n(better-sqlite3)\nchats · settings · RAG · tasks"]
     Skills["SKILL.md skills\n(context injection)"]
@@ -72,7 +72,7 @@ graph TB
 1. The **Browser** is a Next.js React app — it sends POST requests and reads chunked responses via the `useChat` hook.
 2. **proxy.ts** is the authentication middleware. It intercepts every request and verifies the JWT cookie (`agentprimer_session`) before anything else runs. For page routes it redirects unauthenticated requests to `/login` (HTTP 307); for `/api/*` routes it returns `{ error: 'Unauthorized' }` with HTTP 401. The JWT secret comes from the `AGENT_PRIMER_SECRET` environment variable (required in production).
 3. **`app/api/chat/route.ts`** is the entry point for all agent conversations. It saves the user message, then calls `createStreamingAgent()`.
-4. **`lib/agent/streaming-agent.ts`** + **`lib/agent/loop.ts`** are the heart of the system. `lib/agent.ts` itself is just a 28-line barrel re-exporting from `lib/agent/*.ts`; the real implementation lives in fourteen smaller modules (`types.ts`, `openai-client.ts`, `schema.ts`, `sanitize.ts`, `usage.ts`, `stream.ts`, `reasoning.ts`, `messages.ts`, `finalize.ts`, `prompt.ts`, `model-resolver.ts`, `builtin-tools.ts`, `loop.ts`, `streaming-agent.ts`). Covered in depth in [Module 02](./02-agent-loop.md).
+4. **`lib/agent/streaming-agent.ts`** + **`lib/agent/loop.ts`** are the heart of the system. `lib/agent.ts` itself is just a 28-line barrel re-exporting from `lib/agent/index.ts`; the real implementation lives in fifteen smaller modules (`types.ts`, `openai-client.ts`, `schema.ts`, `sanitize.ts`, `usage.ts`, `stream.ts`, `reasoning.ts`, `messages.ts`, `finalize.ts`, `prompt.ts`, `model-resolver.ts`, `model-overrides.ts`, `builtin-tools.ts`, `loop.ts`, `run-manager.ts`, `streaming-agent.ts`). Covered in depth in [Module 02](./02-agent-loop.md). The agent loop now runs **detached** from the HTTP response via `lib/agent/run-manager.ts` — the loop keeps going (and keeps checkpointing to SQLite) even if the browser closes mid-stream; the HTTP response is a thin tail that replays a bounded buffer and forwards new parts live. See [Module 04](./04-streaming.md) for the full mechanism.
 5. The **LLM** (OpenAI-compatible API) provides language intelligence. Any provider that implements `POST /v1/chat/completions` works here. Provider URL and API key are read from the SQLite `settings` table — **not** from `OPENAI_BASE_URL` / `OPENAI_API_KEY` environment variables.
 6. **`data/db/agent.db`** holds most persistent state (chats, settings, RAG, tasks, lessons, token usage). Some state still lives on disk under `data/` — `data/.users` (auth), `data/agents/<agent>/*.md`, `data/system.md`, `data/skills/`, `data/function-tools/`, `data/mcp-servers/`, `data/agent-files/`, `data/uploads/`, `data/models/`.
 7. **Function-tool subprocesses**, **SKILL.md instruction modules**, and **MCP servers** extend the agent's capabilities. These are covered in [Module 03](./03-tools-and-skills.md).
@@ -87,6 +87,7 @@ sequenceDiagram
     participant Browser
     participant proxy.ts
     participant route.ts
+    participant RunManager
     participant agent
     participant OpenAI
     participant DB
@@ -96,23 +97,30 @@ sequenceDiagram
     proxy.ts->>proxy.ts: Verify JWT cookie (agentprimer_session)
     proxy.ts->>route.ts: Forward request
     route.ts->>DB: Save user message
-    route.ts->>agent: createStreamingAgent(params)
+    route.ts->>RunManager: createStreamingAgent(detached:true)
+    RunManager->>RunManager: startRun() — floating promise + AbortController + watchdog
+    RunManager->>agent: runAgentLoop(writer, abortSignal)
     agent->>DB: Read settings (api_key, endpoint, default_model)
     agent->>DB: Read data/agents/<agent>/memory.md + agents/<agent>/agent.md
-    agent->>OpenAI: chat.completions.create({stream:true})
+    agent->>OpenAI: chat.completions.create({stream:true, signal})
     loop Token stream
         OpenAI-->>agent: Delta chunk
-        agent-->>Browser: formatDataStreamPart (SSE line)
+        agent->>RunManager: writer.write(part) → buffer + live subscribers
+        RunManager-->>Browser: tail response replays buffer, forwards live
     end
+    Note over agent,DB: After each step: checkpoint to DB (text, reasoning, tool calls, parts, trace)
     Note over agent,Browser: If model calls a tool:
     agent->>agent: Execute tool (built-in / function tool / MCP)
     agent->>OpenAI: New request with tool result
-    agent-->>Browser: finish_message part
-    agent->>DB: onFinish → save assistant message
+    agent->>RunManager: finish_message part
+    RunManager-->>Browser: forward finish_message
+    agent->>DB: onFinish → save final assistant message
+    RunManager->>RunManager: mark done, clear watchdog, grace-period cleanup
     Browser->>User: Display complete response
+    Note over Browser,RunManager: Browser close only tears down the tail — the loop keeps running
 ```
 
-**Key insight:** The user message is saved to the database *before* the agent runs (line: `route.ts->>DB: Save user message`). This means a server crash mid-response will not lose the user's input — they can reload and the conversation history will be intact up to that message.
+**Key insight:** The user message is saved to the database *before* the agent runs (line: `route.ts->>DB: Save user message`). This means a server crash mid-response will not lose the user's input — they can reload and the conversation history will be intact up to that message. Because the loop is now **detached**, even closing the browser mid-stream does not abort the run: the loop keeps going, checkpoints partial progress to SQLite after every step, and a later reopen polls `/api/chat/active`, re-attaches a tail, and (if the run already finished) simply loads the persisted result from the DB. The **Stop** button (`POST /api/chat/stop`) is the only thing that cancels a run — it fires the run's `AbortController`, which cancels the in-flight `openai.create({ signal })` call and breaks the loop cleanly at the next safe point. A 30-minute wall-clock watchdog force-aborts a hung run so a stuck tool/subprocess can't brick the session.
 
 ---
 
@@ -167,11 +175,14 @@ agentprimer/
 │   │   ├── learn/page.tsx           # In-app curriculum dashboard
 │   │   └── learn/[slug]/page.tsx    # In-app lesson player
 │   ├── api/
-│   │   ├── chat/route.ts            # POST /api/chat – streaming entry point
+│   │   ├── chat/route.ts            # POST /api/chat – streaming entry point (detached run)
+│   │   ├── chat/active/route.ts     # GET /api/chat/active – is a background run live?
+│   │   ├── chat/stop/route.ts       # POST /api/chat/stop – Stop button (aborts the run)
 │   │   ├── approval/route.ts        # GET/POST/DELETE /api/approval
 │   │   ├── sessions/                # CRUD for chat sessions
-│   │   ├── messages/                # Fetch message history for a session
-│   │   ├── settings/                # Read/write settings table
+│   │   ├── messages/                # Paginated message history (cursor-based)
+│   │   ├── messages/trace/route.ts  # GET on-demand trace_json for a single message
+│   │   ├── settings/                # Read/write settings table (incl. model overrides)
 │   │   ├── ui-settings/             # UI-specific preferences
 │   │   ├── system-prompt/route.ts   # GET composed system prompt for inspection
 │   │   ├── reset/route.ts           # POST destructive data reset
@@ -188,6 +199,7 @@ agentprimer/
 │   │   ├── uploads/[filename]/      # Serve uploaded files
 │   │   ├── data-files/route.ts      # Read/write data/ markdown files
 │   │   ├── workspace/               # Browse the workspace filesystem
+│   │   ├── preview/[...slug]/       # Unauthenticated sandboxed preview server (data/preview/)
 │   │   ├── statistics/              # Token usage and turn counts
 │   │   ├── rag/
 │   │   │   ├── health/route.ts      # GET embedding provider health
@@ -261,8 +273,8 @@ agentprimer/
 │   ├── learn-curriculum.ts      # Structured learning curriculum data (lessons, quizzes, experiments)
 │   ├── langfuse.ts              # Optional Langfuse observability integration
 │   ├── path-security.ts         # Sandboxed path resolution helpers
-│   ├── preview-security.ts      # Preview panel CSP / sandbox policy
-│   ├── model-lengths.ts         # KNOWN_CONTEXT_LENGTHS / KNOWN_OUTPUT_LENGTHS fallback tables
+│   ├── preview-security.ts      # Preview panel CSP / sandbox policy + storage shim injection
+│   ├── model-lengths.ts         # KNOWN_CONTEXT_LENGTHS / KNOWN_OUTPUT_LENGTHS fallback tables (client-safe)
 │   ├── schema-utils.ts          # JSON Schema → Zod schema converter
 │   ├── bootstrap.ts             # First-run scaffolding under data/
 │   ├── index.ts                 # lib barrel
@@ -279,6 +291,8 @@ agentprimer/
 │   ├── agents/<agent>/agent.md                # Agent definitions (name, system prompt, tools, model, output schema)
 │   ├── agent-files/             # Files the agent creates and sends to users (send_file)
 │   │   └── <uuid>/<filename>
+│   ├── preview/                # Sandboxed HTML/asset mirror published by open_preview (served by /api/preview/)
+│   ├── projects/               # Working project dirs the agent writes via write_file (mirrored to preview/ on demand)
 │   ├── skills/                  # Cloned SKILL.md skill packages
 │   ├── function-tools/          # Cloned function tool packages
 │   ├── mcp-servers/             # Cloned MCP server packages from GitHub

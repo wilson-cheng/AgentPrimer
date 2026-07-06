@@ -328,7 +328,58 @@ Messages loaded from the database are formatted slightly differently than live s
 
 When `ChatInterface` loads a session's history it calls `setMessages()` to inject the stored messages into the `useChat` hook's state, keeping the same rendering pipeline.
 
+### `pickMessageParts` — why persisted `parts_raw` wins over SDK `parts`
+
+The AI SDK's `setMessages()` runs every message it receives through `fillMessageParts()` → `getMessageParts()`. For a message that arrives *without* a `parts` field, the SDK falls back to building one from `[toolInvocations, reasoning, content]` in that fixed order. From-DB messages come in with `parts_raw` (the persisted `parts_json` snapshot of the agent loop's `allParts`) but **no** `parts` field — and they don't carry a `toolInvocations` field (that data lives in `tool_calls_json`). So the SDK's fallback reduces to `[reasoning, text]` and silently drops every interleaved tool-invocation, flipping the message to the legacy fixed-order render path (reasoning → text at the top, all tool calls grouped at the bottom).
+
+`pickMessageParts` (in `components/chat/helpers.ts`) solves this: whenever `parts_raw` is populated and non-empty, it is parsed and returned as the authoritative `parts` array; otherwise it falls back to `msg.parts`. During live streaming the agent loop initialises `parts_json` to `'[]'` and `mergeServerUpdates()` skips updating `parts_raw` for the in-flight message while `isLoading` is true, so the SDK's live `msg.parts` is used instead.
+
 ---
+
+## Message Loading: Pagination, Lazy Traces & Polling
+
+Long sessions used to crash the browser: the entire message list (including multi-MB `trace_json` blobs) was shipped on every load and every 10-second poll. Three changes fix this:
+
+### 1. Cursor-based pagination (`/api/messages`)
+
+The message reader now supports `limit`, `before`, and `after` query params:
+
+| Param | Purpose |
+|-------|---------|
+| `limit` | Page size (default 50, max 500) |
+| `before` | Cursor: return rows older than this rowid ("Load earlier") |
+| `after` | Cursor: return rows newer than this rowid (polling / post-stream catch-up) |
+
+The response includes `totalCount`, `nextCursor`, and `hasMore` so the UI can show a "Load earlier messages" button and stop when there's nothing older. The `after`-cursor branch is used by the polling effect to fetch only *new* rows instead of reloading the whole session.
+
+### 2. Lazy trace loading (`/api/messages/trace`)
+
+The paginated reader deliberately **omits** `trace_json` — a single multi-step assistant message can persist a multi-MB trace (the full conversation snapshotted at every agent step). Instead it ships only a cheap `has_trace` flag. The Trace Drawer fetches the full trace on demand via `GET /api/messages/trace?messageId=<uuid>` only when the user opens it for that message.
+
+### 3. Trimmed request body (`buildChatRequestBody`)
+
+Because `useChat` ran with `sendExtraMessageFields: true`, every UI-only field (`trace_json`, `parts`, `reasoning`, `token_usage_json`, …) was serialized into the POST body on every turn — even though the server never reads them. A "hi" follow-up became a 15 MB+ POST that crashed the browser. `buildChatRequestBody` (in `components/chat/helpers.ts`) trims each message to just `{ id, role, content, toolInvocations | tool_calls_json }` — the only fields the server needs.
+
+### 4. Merge polling with no-op skip (`storedFieldsEqual`)
+
+The 10-second poll re-fetches the head page and calls `mergeServerUpdates` for each row. `storedFieldsEqual` compares the existing in-memory message against the freshest DB snapshot and skips the update when nothing changed, so visible `MessageRow`s don't re-render on every poll.
+
+---
+
+## Detached Run: Stop Button & Active-Run Polling
+
+Because the agent loop now runs **detached** from the HTTP response (see [Module 04 — Detached Run Manager](./04-streaming.md#detached-run-manager)), the frontend must handle three new scenarios:
+
+| Scenario | Frontend behaviour |
+|----------|--------------------|
+| **Stop button** | `POST /api/chat/stop { sessionId }` fires the run's `AbortController`. The UI shows a Stop button while `isLoading` is true. |
+| **Reopen mid-run** | On session load, `GET /api/chat/active?sessionId=…` reports `{ active: true, assistantMessageId }`. The UI shows a "generating…" indicator + Stop button and re-attaches the stream tail. |
+| **Run finished while away** | The poll's `after`-cursor fetch picks up the completed assistant message from the DB; the UI renders it as a normal historical message. |
+
+The active-run poll runs on session load and periodically while no stream is active, so a browser reopen after a run already finished simply loads the persisted result.
+
+---
+
 
 ## New Components
 
@@ -450,7 +501,7 @@ Beyond the main chat page, the app has several utility pages:
 
 ## Future Expansion
 
-1. **Real-time multi-user chat** — Multiple users sharing a session. Each browser would subscribe to a stream of events for the session. Requires server-side pub/sub (WebSockets or SSE with Redis).
+1. **Message queue** — Currently a second send while a detached run is live is rejected with 409 `RUN_IN_PROGRESS` and the user must wait. A queue would buffer the second turn and run it automatically when the first finishes.
 
 2. **Message editing** — Allow users to edit a previous message and re-generate the response from that point. Requires truncating the message history in the DB.
 

@@ -125,6 +125,56 @@ return createDataStreamResponse({
 
 ---
 
+## Detached Run Manager
+
+Historically `runAgentLoop` ran *inside* the `createDataStreamResponse` `execute` callback, so its lifetime was bound to the HTTP response stream: the moment the browser closed, `request.signal` aborted, the stream was cancelled, `writer.write()` threw, and the loop died mid-step — losing any work not yet persisted.
+
+`lib/agent/run-manager.ts` inverts that. The loop is started as a **floating background promise** (the same `void (async () => …)()` pattern `run_subagent_async` uses) and writes its AI-SDK data-stream parts to a **bounded replay buffer**. The HTTP response is a thin **tail** that replays the buffer and then forwards new parts to the browser live.
+
+```mermaid
+flowchart LR
+    REQ["POST /api/chat"] --> RM["startRun()"]
+    RM --> LOOP["runAgentLoop (floating promise)"]
+    RM --> BUF[("Bounded replay buffer\n(cap 2000 parts)")]
+    LOOP -- "writer.write(part)" --> BUF
+    BUF -- "replay on attach" --> TAIL["createTailResponse"]
+    LOOP -- "live subscriber" --> TAIL
+    TAIL -- "SSE to browser" --> UI["useChat"]
+    STOP["POST /api/chat/stop"] -.->|AbortController| LOOP
+    WD["30 min watchdog"] -.->|force-abort| LOOP
+    LOOP -- "checkpoint each step" --> DB[("SQLite")]
+```
+
+### Why this matters
+
+| Scenario | Old (coupled) | New (detached) |
+|----------|---------------|----------------|
+| Browser closed mid-stream | Loop dies, work lost | Loop keeps running, checkpoints to DB |
+| Reopen mid-run | Partial response gone | Poll `/api/chat/active`, re-attach tail or load from DB |
+| Stop button | Had to rely on `request.signal` | `POST /api/chat/stop` fires `AbortController` — the only cancel path |
+| Hung tool/subprocess | Session stuck until server restart | 30-min watchdog force-aborts; session recovers |
+
+### One active run per session
+
+A second send while a run is still live would race on the same workspace/assistant row. The frontend disables Send while a run is active, but the server-side guard is authoritative: `isSessionRunning(owner, sessionId)` returns `RUN_IN_PROGRESS` (HTTP 409). The check runs *before* saving the user message so a rejected turn leaves no dangling row, and a backstop `catch` rolls back the user message if a rare race slips through.
+
+### The tail response (`createTailResponse`)
+
+The returned `Response` uses `createDataStreamResponse` (preserving the exact wire format + headers `useChat` expects). Its `execute` callback:
+
+1. **Replays** the bounded buffer synchronously (nothing lost between replay and subscribe).
+2. **Subscribes** for live parts — each emitted part is forwarded to the browser via `writer.write(part)`.
+3. **Awaits** `run.donePromise` — when the run finishes (the loop's own `finish_message` is the last part), the stream closes.
+4. If the client disconnects, `writer.write()` throws, the subscriber detaches, but the run continues.
+
+### Heartbeat wrapper
+
+A separate `wrapWithHeartbeat` (in `lib/agent/stream.ts`) wraps the upstream body so a valid AI SDK data-stream `2:` heartbeat is emitted every ~15 seconds of idle time. Without this, Traefik / nginx / Cloudflare may close an idle SSE connection mid-turn while a tool subprocess runs.
+
+---
+
+---
+
 ## Client Side: How `useChat` Consumes It
 
 The `useChat` hook (imported from `ai/react` in this codebase) handles the stream automatically. It:
@@ -208,13 +258,13 @@ The `useChat` hook surfaces this as an `error` object in its return value, which
 
 ## Future Expansion
 
-1. **Resumable streams** — If the browser disconnects mid-stream (network drop, page reload), the current stream is lost. A resumable stream would allow reconnecting and picking up where it left off, keyed by message ID.
+1. **Message queue** — Currently a second send while a run is live is rejected with 409 `RUN_IN_PROGRESS`. A message queue would buffer the second turn and run it automatically when the first finishes, instead of forcing the user to wait and re-send.
 
 2. **Progress events for file operations** — When the agent is writing a large file, emit progress events (`bytes_written`, `total_bytes`) so the UI can show a progress bar.
 
 3. **Partial JSON streaming** — Currently, tool call results are sent as a complete JSON string in the `a:` event. For very large results (e.g., reading a 50 KB file), sending the result in fragments would reduce time-to-first-byte for tool results.
 
-4. **Multi-session broadcasting** — If the same agent session is open in two browser tabs, both should see the same tokens. This would require a pub/sub layer (e.g., Redis Streams or a broadcast channel) to fan out stream events.
+4. **Multi-session broadcasting** — If the same agent session is open in two browser tabs, both should see the same tokens. The detached RunManager already supports multiple subscribers, but a cross-process pub/sub layer (e.g., Redis Streams) would be needed for multi-instance deployments.
 
 ---
 

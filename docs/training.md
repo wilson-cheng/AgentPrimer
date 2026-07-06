@@ -729,9 +729,9 @@ Browser
 proxy.ts               ← validates JWT session cookie for page routes
                           (Next.js 16: must be proxy.ts — middleware.ts is silently ignored)
   ▼
-app/api/chat/route.ts  ← saves user message to SQLite
+app/api/chat/route.ts  ← saves user message to SQLite; rejects if RUN_IN_PROGRESS (409)
   ▼
-lib/agent/streaming-agent.ts  ← createStreamingAgent()
+lib/agent/streaming-agent.ts  ← createStreamingAgent(detached: true)
   │ ├── getAgentConfig()        from data/agents/<agent>/agent.md
   │ ├── readMemory()            from data/agents/<agent>/memory.md
   │ ├── buildSkillDiscoverySection() from lib/skills-loader.ts
@@ -740,20 +740,26 @@ lib/agent/streaming-agent.ts  ← createStreamingAgent()
   │ └── createBuiltinTools()    from lib/agent/builtin-tools.ts + builtin-tools-registry.ts
   │
   ▼
-openai.chat.completions.create({ stream: true, model, messages, tools })
+lib/agent/run-manager.ts  ← startRun(): floating promise + AbortController + 30-min watchdog
+  │                          writes AI-SDK parts to a bounded replay buffer
+  ▼
+openai.chat.completions.create({ stream: true, signal, model, messages, tools })
   │
-  ├── AI calls tool → execute() → append result → call LLM again
-  ├── AI calls tool → execute() → append result → call LLM again
+  ├── AI calls tool → execute() → append result → checkpoint to SQLite → call LLM again
+  ├── AI calls tool → execute() → append result → checkpoint to SQLite → call LLM again
   └── AI produces final text
   │
   ▼
-createDataStreamResponse() ← Vercel AI SDK data stream wire format (browser-compatible)
+createTailResponse()    ← replays buffer, then forwards live parts to browser
+  │                        browser close only tears down the tail — the loop keeps running
   ▼
 Browser useChat() hook  ← streams text to UI in real-time
   │
   ▼
-onFinish() callback    ← saves assistant message to SQLite
+onFinish() callback    ← saves final assistant message to SQLite (overwrites checkpoints)
 ```
+
+> **Detached execution:** The loop runs as a **floating background promise** owned by `lib/agent/run-manager.ts`, not inside the HTTP `execute` callback. Closing the browser mid-stream no longer kills the run — it keeps going, checkpoints partial progress to SQLite after every step, and a later reopen polls `/api/chat/active`, re-attaches a tail, or (if the run already finished) loads the persisted result from the DB. Only `POST /api/chat/stop` (the Stop button) cancels a run, via the run's `AbortController`. One active run per (owner, session) is enforced server-side (409 `RUN_IN_PROGRESS`).
 
 ### Database Schema
 

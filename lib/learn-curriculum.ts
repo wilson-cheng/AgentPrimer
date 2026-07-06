@@ -197,12 +197,14 @@ An agent application is a distributed system in miniature. The browser displays 
 | Concern | Current source of truth |
 |---------|-------------------------|
 | Chat API entry | app/api/chat/route.ts |
+| Detached run manager | lib/agent/run-manager.ts |
 | Streaming turn setup | lib/agent/streaming-agent.ts |
 | ReAct loop | lib/agent/loop.ts |
 | Built-in tools | lib/agent/builtin-tools.ts |
 | Message conversion | lib/agent/messages.ts |
 | System prompt composition | lib/agent/prompt.ts |
 | Structured-output finalize call | lib/agent/finalize.ts |
+| Model length overrides | lib/agent/model-overrides.ts |
 | SQLite schema/helpers | lib/db.ts |
 | Auth middleware | proxy.ts |
 
@@ -564,11 +566,12 @@ Open Tool Playground and choose a file tool. Imagine the model has never seen yo
     level: 'Intermediate',
     estimatedMinutes: 22,
     summary:
-      'Understand why agent apps stream more than text: they stream reasoning, tool-call state, results, usage, and structured UI events.',
+      'Understand why agent apps stream more than text: they stream reasoning, tool-call state, results, usage, and structured UI events. Learn how a detached run manager keeps work alive across browser disconnects.',
     objectives: [
       'Explain streaming as user trust infrastructure',
       'Recognize text/tool/reasoning/data stream events',
       'Design UI that shows progress without lying',
+      'Explain how a detached run survives a browser close',
     ],
     content: `# Streaming and Agent UX
 
@@ -598,6 +601,18 @@ Agent work can be slow because it may include multiple model calls, tool calls, 
 
 Streaming is not just performance polish. It is trust infrastructure. If an agent is going to run commands, inspect files, or call external services, the user should see what is happening as it happens.
 
+## Detached runs: work that survives a browser close
+
+In older chat apps, closing the browser tab mid-stream killed the response — the loop was tied to the HTTP connection. AgentPrimer decouples them: the agent loop runs as a **detached background promise** inside \`lib/agent/run-manager.ts\`. The HTTP response is just a thin "tail" that replays a buffer and forwards new tokens live.
+
+- Close the browser → the tail tears down, but the loop keeps running and keeps checkpointing to SQLite after every step.
+- Reopen mid-run → the UI polls \`/api/chat/active\`, sees the run is live, and re-attaches a tail.
+- Run finished while away → the completed message is loaded from the database on the next poll.
+- Stop button → \`POST /api/chat/stop\` fires the run's AbortController, the only thing that cancels a run.
+- One active run per session → a second send while a run is live is rejected with 409 \`RUN_IN_PROGRESS\`.
+
+This is the same pattern used for background sub-agents: a floating promise that outlives the request that started it.
+
 ## Try it yourself: read the stream
 
 Open DevTools → Network, send a prompt that causes a tool call, and watch the response body. You will see different event kinds: text, tool start, tool delta, tool result, data, finish step, and finish message.`,
@@ -613,6 +628,13 @@ Open DevTools → Network, send a prompt that causes a tool call, and watch the 
         title: 'Inspect stream chunks',
         instructions:
           'Use browser DevTools to inspect /api/chat while a response streams. Identify at least two non-text event types.',
+        href: '/chat',
+        cta: 'Open Chat',
+      },
+      {
+        title: 'Test the detached run',
+        instructions:
+          'Start a tool-heavy prompt, then close the browser tab while it is still streaming. Reopen the same session — the run should have continued in the background and the result should appear (or a Stop button should still be active if it is still running).',
         href: '/chat',
         cta: 'Open Chat',
       },
@@ -655,6 +677,19 @@ Open DevTools → Network, send a prompt that causes a tool call, and watch the 
         ],
         answer: 0,
         explanation: 'Dangerous actions need human-in-the-loop visibility and control.',
+      },
+      {
+        id: '04-detached',
+        prompt: 'What happens if you close the browser while an agent run is still streaming?',
+        options: [
+          'The loop keeps running in the background and checkpoints to the database; a reopen re-attaches or loads the result',
+          'The run is immediately cancelled and all progress is lost',
+          'The server restarts',
+          'The model is charged again for the full response',
+        ],
+        answer: 0,
+        explanation:
+          'The loop runs as a detached floating promise. Only the Stop button (POST /api/chat/stop) cancels it.',
       },
     ],
   },
