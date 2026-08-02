@@ -17,7 +17,7 @@ Then ask the agent (in a chat): *"What are the key features of AgentPrimer?"*
 
 **Expected:**
 
-1. Agent calls `search_knowledge_base({ query: "key features of AgentPrimer", top_k: 5 })`
+1. Agent calls `search_rag({ query: "key features of AgentPrimer", top_k: 5 })`
 2. The RAG pipeline searches the vector index or FTS5 fallback
 3. Returns relevant chunks from the ingested document
 4. Agent reads the chunks and produces an answer citing the features
@@ -78,7 +78,7 @@ Then:
 **Expected:** The agent still returns results. The search is now keyword-based (FTS5) instead of semantic (vector). Exact keyword matches work, but synonyms and paraphrased queries will be less accurate.
 
 **How the fallback works (`lib/rag.ts`):**
-- When the agent calls `search_knowledge_base`, `retrieveChunks` first tries the vector search via the in-process embedder (`embedLocal()` in `lib/embeddings.ts`)
+- When the agent calls `search_rag`, `retrieveChunks` first tries the vector search via the in-process embedder (`embedLocal()` in `lib/embeddings.ts`)
 - If the embedding model is unavailable or returns an error, it falls back to FTS5:
   ```sql
   SELECT chunk_text FROM knowledge_fts WHERE chunk_text MATCH ?
@@ -170,7 +170,7 @@ export async function buildSystemPromptWithAutoRag(
 |-----|-----|
 | Always up-to-date context without explicit search tools | Every user message triggers a RAG call — adds latency |
 | Works even for agents whose tools are restricted | Wastes tokens on irrelevant retrievals |
-| Simpler agent (no need to call search_knowledge_base) | Agent cannot decide when to search vs. not search |
+| Simpler agent (no need to call search_rag) | Agent cannot decide when to search vs. not search |
 
 **Current approach (tool-based) is generally better because:**
 1. The agent can decide relevance — it only searches when the query is actually knowledge-related

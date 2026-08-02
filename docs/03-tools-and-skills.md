@@ -103,7 +103,7 @@ All built-in tool **implementations** live in `lib/agent/builtin-tools.ts` (insi
 | `copy_path` | filesystem | — | ✅ | Copy a file or directory |
 | `stat_path` | filesystem | — | ✅ | Get file metadata (size, type, mode, timestamps) |
 | `search_files` | filesystem | — | ✅ | Grep/glob search across files (by name or content) |
-| `search_knowledge_base` | memory | — | ✅ | Semantic vector search (or FTS5 fallback) over the RAG — use when the user references uploaded documents |
+| `search_rag` | memory | - | ✅ | Semantic vector search (or FTS5 fallback) over the RAG index - use when the user references uploaded documents |
 | `run_shell` | shell | ✓ always | ❌ | Execute shell commands — **disabled by default**, must be opted in via Settings |
 
 See [Approval Gate →](./06-approval-gate.md) for how approval works.

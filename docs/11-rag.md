@@ -12,7 +12,7 @@ After reading this module you will be able to:
 - Trace the retrieval pipeline: embed query → cosine similarity → inject
 - Understand the in-process embedding model and its graceful degradation design
 - Use the RAG UI to upload, search, and manage documents
-- Use the `search_knowledge_base` tool in an agent
+- Use the `search_rag` tool in an agent
 
 ---
 
@@ -45,7 +45,7 @@ graph TB
     end
 
     subgraph Retrieval
-        Query["search_knowledge_base tool\nor /api/rag/search"] --> EmbedQ
+        Query["search_rag tool\nor /api/rag/search"] --> EmbedQ
         EmbedQ["embed query"] --> Cosine
         Cosine["cosineSimilarity() - JS\nO(n) scan all chunks"] --> TopK
         TopK["top-k chunks\n(fallback: FTS5 BM25)"] --> Result
@@ -165,9 +165,9 @@ Note the ordering: we first check whether any rows are embedded with the current
 
 ---
 
-## The `search_knowledge_base` Built-in Tool
+## The `search_rag` Built-in Tool
 
-Agents search the RAG index via the `search_knowledge_base` built-in tool:
+Agents search the RAG index via the `search_rag` built-in tool:
 
 ```typescript
 parameters: z.object({
@@ -184,7 +184,7 @@ parameters: z.object({
 
 The tool calls `retrieveChunks(query, top_k)` and returns matching text as the tool result. The agent uses that context to answer the user.
 
-**The agent does NOT auto-retrieve on every turn** — it must decide to call `search_knowledge_base`. This is standard RAG design and has educational value: you can watch the agent choose when to search vs. answer from memory.
+**The agent does NOT auto-retrieve on every turn** - it must decide to call `search_rag`. This is standard RAG design and has educational value: you can watch the agent choose when to search vs. answer from memory.
 
 ---
 
@@ -260,7 +260,7 @@ O(dimensions × chunks) — for 384-dim and 10k chunks: ~3.8M multiplications, w
 |-----------|---------------|-------------|
 | **O(n) retrieval** | Full table scan per query | Add `sqlite-vec` extension for HNSW approximate nearest-neighbor |
 | **384-dim local model** | Lower quality than large models | Set `embedding_provider = openai` in Settings |
-| **Manual tool call** | Agent must choose to search with `search_knowledge_base` | Add auto-retrieval hook in `buildSystemPrompt()` |
+| **Manual tool call** | Agent must choose to search with `search_rag` | Add auto-retrieval hook in `buildSystemPrompt()` |
 | **No re-ranking** | Top-k by cosine only | Add cross-encoder re-ranking for better precision |
 | **Text only** | No image/audio ingestion | Call vision model during ingestion to describe images |
 
@@ -268,7 +268,7 @@ O(dimensions × chunks) — for 384-dim and 10k chunks: ~3.8M multiplications, w
 
 ## Exercises
 
-1. **Upload a document:** Go to `/knowledge`, paste a product spec or README, and ingest it. Ask the agent a question about that content and watch it call `search_knowledge_base`.
+1. **Upload a document:** Go to `/knowledge`, paste a product spec or README, and ingest it. Ask the agent a question about that content and watch it call `search_rag`.
 
 2. **Inspect chunks via SQL:**
    ```sql

@@ -60,7 +60,7 @@ graph TB
     Agent -- "fs.readFile / unlink…" --> FS
     Agent -- "reads at startup" --> Memory
     Agent -- "saves response" --> DB
-    Agent -- "search_knowledge_base" --> DB
+    Agent -- "search_rag" --> DB
     Chat -- "reads settings / saves messages" --> DB
     Browser -- "GET /api/sessions, /api/rag, etc." --> Chat
     Agent -- "embedTexts() in-process" --> Embed

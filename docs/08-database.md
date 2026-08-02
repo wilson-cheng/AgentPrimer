@@ -370,7 +370,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
 );
 ```
 
-The FTS5 table provides keyword-based search (BM25 ranking) without requiring an embedding model. The `search_knowledge_base` tool automatically falls back to FTS5 if vector search returns no results.
+The FTS5 table provides keyword-based search (BM25 ranking) without requiring an embedding model. The `search_rag` tool automatically falls back to FTS5 if vector search returns no results.
 
 ### `token_usage_log`
 

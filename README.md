@@ -191,7 +191,7 @@ The running agent comes with **22 built-in tools** out of the box:
 
 - **File system**: `read_file`, `write_file`, `edit_file`, `append_file`, `list_directory`, `make_directory`, `delete_path`, `move_path`, `copy_path`, `stat_path`, `search_files`
 - **Output**: `send_file` (inline preview in chat), `open_preview` (Preview Panel)
-- **Memory / knowledge**: `append_memory`, `replace_memory`, `search_knowledge_base`
+- **Memory / knowledge**: `append_memory`, `replace_memory`, `add_to_rag`, `search_rag`
 - **Agents**: `create_agent`, `run_subagent_async` (background task), `update_task_status`, `list_tasks`
 - **Skills**: `load_skill` (loads full SKILL.md instructions on demand)
 - **Shell**: `run_shell` (opt-in, requires explicit enable and approval)

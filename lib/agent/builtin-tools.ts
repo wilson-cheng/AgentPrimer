@@ -41,7 +41,7 @@ import type { ApprovalOperation } from '../approval-store';
 import { isBuiltinToolEnabled, listBuiltinToolsWithState } from '../builtin-tools-registry';
 import { copyFileToAgentFiles } from '../agent-files';
 import type { AgentFileResult } from '../agent-files';
-import { retrieveChunks } from '../rag';
+import { retrieveChunks, ingestDocument } from '../rag';
 import { getEffectiveOutputLength } from './model-overrides';
 import { startSubagentMonitor } from '../subagent-monitor';
 import {
@@ -1180,9 +1180,9 @@ export function createBuiltinTools(
     }),
 
     // ── RAG ────────────────────────────────────────────────────────────────
-    search_knowledge_base: tool({
+    search_rag: tool({
       description:
-        'Search RAG indexed documents for relevant context. ' +
+        'Search the RAG index for relevant context. ' +
         'Use this when the user references uploaded files, asks about stored information, ' +
         'or needs document-grounded answers. Performs semantic vector retrieval with ' +
         'automatic fallback to keyword (FTS5) search.',
@@ -1199,9 +1199,56 @@ export function createBuiltinTools(
       execute: async ({ query, top_k }) => {
         const chunks = await retrieveChunks(query as string, (top_k as number | undefined) ?? 5);
         if (chunks.length === 0) {
-          return 'No relevant RAG content found. The RAG index may be empty — ask the user to add documents via the RAG page.';
+          return 'No relevant RAG content found. The RAG index may be empty - ask the user to add documents via the RAG page, or use the add_to_rag tool to store useful information yourself.';
         }
         return chunks.map((c, i) => `[Result ${i + 1}]\n${c}`).join('\n\n---\n\n');
+      },
+    }),
+
+    add_to_rag: tool({
+      description:
+        'Add a document to the RAG index so it can be retrieved later with search_rag. ' +
+        'Use this when the conversation reveals durable information worth storing for future ' +
+        'semantic retrieval - e.g. reference material, research notes, decisions, or any text ' +
+        'that future conversations may need to look up. The content is automatically chunked, ' +
+        'embedded, and indexed. This is complementary to append_memory (which stores short notes ' +
+        'in the system prompt); use add_to_rag for longer or more structured content that should ' +
+        'be retrieved on demand rather than always loaded.',
+      parameters: z.object({
+        name: z
+          .string()
+          .min(1)
+          .describe(
+            'A short, descriptive title for this RAG entry (e.g. "Meeting notes 2025-01-15").',
+          ),
+        content: z
+          .string()
+          .min(1)
+          .describe('The full text to index. Markdown is fine.'),
+      }),
+      execute: async ({ name, content }) => {
+        const result = await ingestDocument({
+          name: name as string,
+          sourceType: 'agent',
+          content: content as string,
+          originalContent: content as string,
+          originalMime: 'text/plain',
+        });
+        if (result.skipped) {
+          return {
+            success: true,
+            skipped: true,
+            message: `Identical content for "${name}" was already in the RAG index (${result.chunks} chunks).`,
+            sourceId: result.sourceId,
+            chunks: result.chunks,
+          };
+        }
+        return {
+          success: true,
+          message: `Added "${name}" to the RAG index (${result.chunks} chunks, embedded: ${result.embedded}).`,
+          sourceId: result.sourceId,
+          chunks: result.chunks,
+        };
       },
     }),
   };

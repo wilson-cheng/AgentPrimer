@@ -76,7 +76,7 @@ export async function POST(req: Request) {
   const systemPrompt =
     'You are a precise summarizer. Produce a self-contained summary that ' +
     'preserves the key facts, decisions, and code snippets so it is useful ' +
-    'as a standalone knowledge-base entry. Use clear markdown with short ' +
+    'as a standalone RAG entry. Use clear markdown with short ' +
     'sections. Do not invent information.';
 
   try {

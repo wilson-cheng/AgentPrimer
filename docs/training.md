@@ -971,7 +971,7 @@ Structured output is rendered in the `StructuredOutputPanel` component — a for
 
 ```
 Without RAG: system prompt = instructions + ALL of agents/<agent>/memory.md
-With RAG:    agent calls search_knowledge_base → top-k relevant chunks return as a tool result
+With RAG:    agent calls search_rag → top-k relevant chunks return as a tool result
 ```
 
 ### The Four Stages
@@ -990,11 +990,11 @@ With RAG:    agent calls search_knowledge_base → top-k relevant chunks return 
 3. Add a document (Markdown, plain text, PDF)
 4. The document is automatically chunked and embedded
 
-The agent then uses the `search_knowledge_base` tool to query it:
+The agent then uses the `search_rag` tool to query it:
 
 ```
 User: "What were the action items from last week's meeting?"
-Agent: → calls search_knowledge_base("action items last week meeting")
+Agent: → calls search_rag("action items last week meeting")
        → retrieves 3 relevant chunks from meeting notes you uploaded
        → synthesizes an answer from those chunks
 ```

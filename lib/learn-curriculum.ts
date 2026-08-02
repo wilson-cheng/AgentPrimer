@@ -1361,9 +1361,9 @@ RAG can retrieve irrelevant chunks, miss synonyms, or surface stale documents. G
 
 ## Why fallback matters
 
-Local embedding models may fail to load. Cloud embedding keys may be absent. AgentPrimer falls back to SQLite FTS5 keyword search so the knowledge base remains useful in degraded mode.
+Local embedding models may fail to load. Cloud embedding keys may be absent. AgentPrimer falls back to SQLite FTS5 keyword search so the RAG index remains useful in degraded mode.
 
-## Try it yourself: build a tiny knowledge base
+## Try it yourself: build a tiny RAG index
 
 Paste a short document into RAG. Ask a question whose answer is present and another whose answer is not. Compare whether the agent uses retrieved context or guesses.`,
     experiments: [
@@ -1377,7 +1377,7 @@ Paste a short document into RAG. Ask a question whose answer is present and anot
       {
         title: 'Ask a grounded question',
         instructions:
-          'After indexing a document, ask the agent a question that requires it. Check the trace for search_knowledge_base.',
+          'After indexing a document, ask the agent a question that requires it. Check the trace for search_rag.',
         href: '/chat',
         cta: 'Open Chat',
       },

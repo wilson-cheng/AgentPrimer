@@ -210,10 +210,18 @@ export const BUILTIN_TOOLS: BuiltinToolMeta[] = [
 
   // RAG
   {
-    id: 'search_knowledge_base',
+    id: 'search_rag',
     label: 'Search RAG',
     description:
-      'Semantic (vector) or keyword retrieval over indexed documents. Use when the user references uploaded files, asks about stored RAG content, or requests document-grounded answers.',
+      'Semantic (vector) or keyword retrieval over the RAG index. Use when the user references uploaded files, asks about stored RAG content, or requests document-grounded answers.',
+    category: 'memory',
+    defaultEnabled: true,
+  },
+  {
+    id: 'add_to_rag',
+    label: 'Add to RAG',
+    description:
+      'Add a document to the RAG index so the agent can retrieve it later with search_rag. Use for durable reference material, research notes, or any text worth storing for future semantic retrieval.',
     category: 'memory',
     defaultEnabled: true,
   },
